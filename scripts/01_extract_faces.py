@@ -125,29 +125,15 @@ def catalog_celeb_df_v2(dataset_root: Path) -> list[VideoRecord]:
 
 
 def catalog_df40(dataset_root: Path) -> list[VideoRecord]:
-    """DF40 layout (subset of diffusion-based techniques):
+    """DF40 is shipped as pre-processed face-cropped IMAGES, not videos.
 
-    df40/<technique>/<real|fake>/*.mp4
+    scripts/01 is for raw-video → face-extraction workflows (FF++, Celeb-DF).
+    Use ``scripts/01b_catalog_df40.py`` to catalog DF40 directly.
+
+    Returning an empty list so gen3 extraction over FF++/Celeb-DF still
+    succeeds even when ``df40_diffusion_subset`` is listed in the config.
     """
-    records: list[VideoRecord] = []
-    if not dataset_root.is_dir():
-        return records
-    for tech_dir in sorted(p for p in dataset_root.iterdir() if p.is_dir()):
-        technique = tech_dir.name
-        for split_name, label in (("real", 0), ("fake", 1)):
-            split_dir = tech_dir / split_name
-            if not split_dir.is_dir():
-                continue
-            for v in _walk_mp4(split_dir):
-                records.append(
-                    {
-                        "video_path": v,
-                        "video_id": f"{technique}_{split_name}_{v.stem}",
-                        "label": label,
-                        "technique": technique,
-                    }
-                )
-    return records
+    return []
 
 
 def catalog_deepfake_eval_2024(dataset_root: Path) -> list[VideoRecord]:
