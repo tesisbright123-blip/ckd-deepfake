@@ -1,0 +1,24 @@
+# Normalize line endings: store as LF, checkout as native
+* text=auto eol=lf
+
+# Python files always LF
+*.py text eol=lf
+
+# YAML / config files always LF
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.toml text eol=lf
+
+# Binary files — no line-ending conversion
+*.pth    binary
+*.npy    binary
+*.onnx   binary
+*.tflite binary
+*.png    binary
+*.pdf    binary
+*.jpg    binary
+*.jpeg   binary
+*.ipynb  text eol=lf

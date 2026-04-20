@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model weights & data
+*.npy
+*.pth
+*.ckpt
+*.pt
+*.tflite
+*.onnx
+data/
+outputs/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logging & tracking
+wandb/
+runs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.venv/
+venv/
+env/

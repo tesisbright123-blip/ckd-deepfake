@@ -1,0 +1,114 @@
+# ===== Teacher Config =====
+teacher:
+  models:
+    - name: efficientnet_b4
+      source: deepfakebench
+      weight_path: "{drive}/checkpoints/teachers/efficientnet_b4.pth"
+      input_size: 224
+      ensemble_weight: auto
+    - name: recce
+      source: deepfakebench
+      weight_path: "{drive}/checkpoints/teachers/recce.pth"
+      input_size: 224
+      ensemble_weight: auto
+    - name: clip_vit_l14
+      source: clipping
+      weight_path: "{drive}/checkpoints/teachers/clip_clipping.pth"
+      input_size: 224
+      ensemble_weight: auto
+  temperature: 4.0
+
+# ===== Student Config =====
+student:
+  architecture: mobilenetv3_large
+  pretrained: imagenet
+  num_classes: 2
+  head:
+    hidden_dim: 256
+    dropout: 0.2
+  input_size: 224
+
+# ===== Data Config =====
+data:
+  face_extraction:
+    detector: retinaface
+    fallback: mtcnn
+    margin: 0.3
+    output_size: 224
+    frames_per_video: 32
+  augmentation:
+    image_compression: [40, 100]
+    gauss_noise_sigma: [0, 20]
+    gauss_blur_kernel: [3, 7]
+    horizontal_flip_p: 0.5
+    brightness_contrast: 0.2
+    shift_scale_rotate: [0.0625, 0.1, 10]
+  generations:
+    gen1:
+      name: "Gen 1 (Autoencoder/GAN Awal)"
+      datasets: ["faceforensics_pp_c23"]
+      techniques: ["DeepFakes", "Face2Face", "FaceSwap", "NeuralTextures"]
+      split_ratio: [0.7, 0.15, 0.15]
+    gen2:
+      name: "Gen 2 (Advanced GAN)"
+      datasets: ["celeb_df_v2"]
+      techniques: ["Advanced GAN face-swap (Celeb-DF synthesis)"]
+      split_ratio: [0.7, 0.15, 0.15]
+    gen3:
+      name: "Gen 3 (Diffusion-based & Modern)"
+      datasets: ["df40_diffusion_subset", "deepfake_eval_2024"]
+      techniques: ["Diffusion-based face swap/inpainting", "Modern face-swap variants"]
+      split_ratio: [0.7, 0.15, 0.15]
+      note: "DF40 untuk training volume; DeepFake-Eval-2024 untuk in-the-wild eval"
+
+# ===== Training Config =====
+training:
+  initial_distillation:
+    optimizer: adamw
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-4
+    scheduler: cosine_annealing
+    batch_size: 64
+    num_epochs: 30
+    early_stopping_patience: 5
+    alpha: 0.7
+    temperature: 4.0
+
+  continual_distillation:
+    optimizer: adamw
+    learning_rate: 5.0e-5
+    weight_decay: 1.0e-4
+    scheduler: cosine_annealing
+    batch_size: 64
+    num_epochs: 10
+    early_stopping_patience: 3
+    alpha: 0.5
+    beta: 0.3
+    gamma: 0.2
+
+  anti_forgetting:
+    method: replay
+    ewc:
+      lambda: 5000
+      fisher_samples: 1000
+    lwf:
+      temperature: 2.0
+    replay:
+      buffer_percentage: 0.05
+      selection: herding
+
+# ===== Evaluation Config =====
+evaluation:
+  metrics: [auc, log_loss, accuracy, cde, cgrs]
+  num_seeds: 3
+  scenarios: [S1, S2, S3]
+
+# ===== Edge Deployment Config =====
+edge:
+  tflite_quantization: [float16, int8]
+  benchmark_num_runs: 100
+
+# ===== Paths (template, filled at runtime) =====
+paths:
+  drive_root: "/content/drive/MyDrive/CKD_Thesis"
+  colab_local: "/content/ckd_local"
