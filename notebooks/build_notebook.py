@@ -317,9 +317,14 @@ CELLS.append(code(
     "    --generation gen2 --method replay --previous-checkpoint $PREV\n"
 ))
 
-CELLS.append(md("## 12. Continual distillation: gen2 → gen3"))
+CELLS.append(md(
+    "## 12. Continual distillation: gen2 → gen3\n"
+    "\n"
+    "Previous checkpoint path suffix changes for gen2 because script 05 writes under "
+    "`checkpoints/students/{gen}_{method}/best.pth` (so gen2+replay lives at `gen2_replay/`).\n"
+))
 CELLS.append(code(
-    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/students/gen2/best.pth'\n"
+    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/students/gen2_replay/best.pth'\n"
     "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
     "    --generation gen3 --method replay --previous-checkpoint $PREV\n"
 ))
@@ -331,9 +336,13 @@ CELLS.append(md(
     "latency + accuracy on the test split.\n"
 ))
 CELLS.append(code(
+    "# gen1 comes from scripts/04 (no --method). gen2/gen3 come from\n"
+    "# scripts/05 with method=replay, so we pass --method replay to help\n"
+    "# the script resolve the right checkpoint subdir.\n"
     "for gen in ['gen1', 'gen2', 'gen3']:\n"
+    "    method_flag = '' if gen == 'gen1' else '--method replay'\n"
     "    !python scripts/07_edge_evaluation.py --config configs/default.yaml \\\n"
-    "        --generation $gen --modes fp32,fp16,int8 --num-runs 100\n"
+    "        --generation $gen $method_flag --modes fp32,fp16,int8 --num-runs 100\n"
 ))
 
 CELLS.append(md("## 14. Generate thesis figures"))
