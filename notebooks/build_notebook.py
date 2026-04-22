@@ -64,8 +64,8 @@ CELLS.append(code(
     "DRIVE_ROOT = Path('/content/drive/MyDrive/CKD_Thesis')\n"
     "DRIVE_ROOT.mkdir(parents=True, exist_ok=True)\n"
     "for sub in ['datasets/raw', 'datasets/faces', 'datasets/splits',\n"
-    "            'checkpoints/teachers', 'checkpoints/student',\n"
-    "            'soft_labels', 'runs', 'results', 'figures']:\n"
+    "            'checkpoints/teachers', 'checkpoints/students',\n"
+    "            'soft_labels', 'runs', 'results', 'results/figures']:\n"
     "    (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)\n"
     "print('Drive root:', DRIVE_ROOT)\n"
 ))
@@ -274,18 +274,23 @@ CELLS.append(code(
     "!python scripts/04_initial_distillation.py --config configs/default.yaml --generation gen1\n"
 ))
 
-CELLS.append(md("## 11. Continual distillation: gen1 → gen2"))
+CELLS.append(md(
+    "## 11. Continual distillation: gen1 → gen2\n"
+    "\n"
+    "Anti-forgetting method is selected via `--method` (one of `replay`, `ewc`, `lwf`). "
+    "We default to **replay** (small rehearsal buffer — typically best AUC/forgetting trade-off).\n"
+))
 CELLS.append(code(
-    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/student/gen1_best.pth'\n"
+    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/students/gen1/best.pth'\n"
     "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
-    "    --generation gen2 --previous-checkpoint $PREV\n"
+    "    --generation gen2 --method replay --previous-checkpoint $PREV\n"
 ))
 
 CELLS.append(md("## 12. Continual distillation: gen2 → gen3"))
 CELLS.append(code(
-    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/student/gen2_best.pth'\n"
+    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/students/gen2/best.pth'\n"
     "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
-    "    --generation gen3 --previous-checkpoint $PREV\n"
+    "    --generation gen3 --method replay --previous-checkpoint $PREV\n"
 ))
 
 CELLS.append(md(
@@ -297,13 +302,13 @@ CELLS.append(md(
 CELLS.append(code(
     "for gen in ['gen1', 'gen2', 'gen3']:\n"
     "    !python scripts/07_edge_evaluation.py --config configs/default.yaml \\\n"
-    "        --generation $gen --modes fp32 fp16 int8 --num-runs 100\n"
+    "        --generation $gen --modes fp32,fp16,int8 --num-runs 100\n"
 ))
 
 CELLS.append(md("## 14. Generate thesis figures"))
 CELLS.append(code(
     "!python scripts/08_generate_figures.py --config configs/default.yaml\n"
-    "!ls /content/drive/MyDrive/CKD_Thesis/figures\n"
+    "!ls /content/drive/MyDrive/CKD_Thesis/results/figures\n"
 ))
 
 CELLS.append(md(
@@ -312,9 +317,9 @@ CELLS.append(md(
     "\n"
     "Deliverables on Drive:\n"
     "\n"
-    "- `checkpoints/student/gen{1,2,3}_best.pth` — student after each stage\n"
+    "- `checkpoints/students/gen{1,2,3}/best.pth` — student after each stage\n"
     "- `results/edge_*.json` — TFLite latency/accuracy\n"
-    "- `figures/*.pdf` — thesis-ready plots (CDE, CGRS, S1–S3 heatmaps, latency bars)\n"
+    "- `results/figures/*.pdf` — thesis-ready plots (CDE, CGRS, S1–S3 heatmaps, latency bars)\n"
 ))
 
 
