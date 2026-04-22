@@ -1,41 +1,58 @@
-"""Step 1b: Catalog DF40 pre-processed face images (gen3).
+"""Step 1b: Catalog DF40 pre-processed face images.
 
-Entrypoint script — invoked via CLI, not imported by other code.
+CLI entrypoint. Not imported by other code.
 
-DF40 ships as already face-cropped images (not raw videos), so the normal
-face-extractor in scripts/01 is not needed. This script enumerates the
-DF40 image tree, borrows REAL rows from an earlier generation's metadata
-(typically ``gen1`` = FF++ real), and writes a combined ``metadata_gen3.csv``
+DF40 ships as already face-cropped images (not raw videos). This script
+enumerates the DF40 image tree and writes a ``metadata_<generation>.csv``
 that downstream scripts (02 splits, 03 soft labels) can consume.
+
+Because DF40 contains 40 techniques spanning the full deepfake history,
+the CKD pipeline partitions DF40 into three generational buckets
+(gen1 = classic face-swap, gen2 = reenactment, gen3 = diffusion & modern).
+The technique list for each generation is read from
+``configs/default.yaml -> data.generations.<gen>.techniques``.
 
 Expected DF40 layout on Drive (after ``gdown`` download):
 
     {drive}/datasets/raw/df40/
         <technique>/
-            ff/                   or   cdf/
-                <video_id>/
+            ff/   or  cdf/   or  fake/      <- fake crops
+                [<video_id>/]
                     frame_00.png
                     frame_01.png
                     ...
 
+Real faces come from a separate DF40 real pool:
+
+    {drive}/datasets/raw/df40_real/
+        ff_real/<video_id>/*.png
+        cdf_real/<video_id>/*.png
+
+(or any folder whose leaves contain face images — we just glob and label 0).
+
 Accepted image extensions: .png, .jpg, .jpeg, .webp.
 
 Usage:
-    python scripts/01b_catalog_df40.py                                     # defaults
-    python scripts/01b_catalog_df40.py --borrow-real-from gen1 \
-        --techniques sd_2_1,ddpm,rddm
-    python scripts/01b_catalog_df40.py --no-borrow-real                   # only DF40 fakes
+    # Let config drive the technique list + domains (typical).
+    python scripts/01b_catalog_df40.py --config configs/default.yaml \
+        --generation gen1
+
+    # Override techniques from CLI.
+    python scripts/01b_catalog_df40.py --generation gen2 \
+        --techniques fomm,facevid2vid,wav2lip
+
+    # Only write DF40 fakes, no reals.
+    python scripts/01b_catalog_df40.py --generation gen3 --no-real
 
 Reads:
     YAML config (--config).
-    DF40 preprocessed images at {drive}/datasets/raw/df40/**/*.png
-    (Optional) prior metadata at
-        {drive}/datasets/faces/metadata_{borrow_from}.csv   for real rows.
+    DF40 fake images at {drive}/datasets/raw/df40/**/*.png
+    DF40 real images at {drive}/datasets/raw/df40_real/**/*.png
 Writes:
-    {drive}/datasets/faces/metadata_gen3.csv
+    {drive}/datasets/faces/metadata_<generation>.csv
         columns: face_path, frame_idx, video_id, label, dataset,
                  generation, technique
-    Log file at runs/catalog_df40.log
+    Log file at runs/catalog_df40_<generation>.log
 """
 from __future__ import annotations
 
@@ -66,6 +83,12 @@ _COLUMNS: tuple[str, ...] = (
     "technique",
 )
 
+# DF40 fake-crop subfolders we try under each technique directory.
+# Most techniques use ff/cdf; a handful (MidJourney, StarGAN, e4e, CollabDiff,
+# whichfaceisreal) use fake/real; some have no domain folder at all.
+_FAKE_DOMAINS: tuple[str, ...] = ("ff", "cdf", "fake")
+_REAL_DOMAINS_IN_TECH: tuple[str, ...] = ("real",)
+
 
 def _iter_images(folder: Path) -> list[Path]:
     out: list[Path] = []
@@ -77,8 +100,8 @@ def _iter_images(folder: Path) -> list[Path]:
 def _group_by_video(images: list[Path], domain_dir: Path) -> dict[str, list[Path]]:
     """Cluster images by immediate parent folder (= ``video_id``).
 
-    If images live directly under ``domain_dir`` (flat layout) we treat each
-    file as its own single-frame video.
+    If images live directly under ``domain_dir`` (flat layout) each file
+    becomes its own single-frame video.
     """
     grouped: dict[str, list[Path]] = {}
     for img in images:
@@ -93,25 +116,36 @@ def _group_by_video(images: list[Path], domain_dir: Path) -> dict[str, list[Path
     return grouped
 
 
-def catalog_df40_preprocessed(
-    dataset_root: Path,
+def _catalog_technique_dir(
+    tech_dir: Path,
     *,
-    allow_techniques: set[str] | None = None,
-    domains: tuple[str, ...] = ("ff", "cdf"),
+    technique: str,
+    generation: str,
+    label: int,
+    logger,
 ) -> list[dict[str, Any]]:
-    """Enumerate DF40 face-cropped images and emit metadata rows (all FAKE)."""
+    """Walk one technique folder and emit rows.
+
+    Handles three layouts:
+      1) <tech_dir>/<ff|cdf|fake>/<video_id>/*.png  (typical)
+      2) <tech_dir>/<video_id>/*.png                (no domain folder)
+      3) <tech_dir>/*.png                           (flat)
+    """
     rows: list[dict[str, Any]] = []
-    if not dataset_root.is_dir():
+    if not tech_dir.is_dir():
         return rows
 
-    for tech_dir in sorted(p for p in dataset_root.iterdir() if p.is_dir()):
-        technique = tech_dir.name
-        if allow_techniques and technique not in allow_techniques:
-            continue
-        for domain in domains:
+    domains_present = [
+        d
+        for d in _FAKE_DOMAINS
+        if (tech_dir / d).is_dir()
+    ] if label == 1 else [
+        d for d in _REAL_DOMAINS_IN_TECH if (tech_dir / d).is_dir()
+    ]
+
+    if domains_present:
+        for domain in domains_present:
             domain_dir = tech_dir / domain
-            if not domain_dir.is_dir():
-                continue
             imgs = _iter_images(domain_dir)
             if not imgs:
                 continue
@@ -123,53 +157,151 @@ def catalog_df40_preprocessed(
                             "face_path": str(face_path),
                             "frame_idx": frame_idx,
                             "video_id": f"{technique}_{domain}_{vid_id}",
-                            "label": 1,  # all DF40 images are fake
-                            "dataset": "df40_diffusion_subset",
-                            "generation": "gen3",
+                            "label": label,
+                            "dataset": "df40",
+                            "generation": generation,
                             "technique": technique,
                         }
                     )
+    else:
+        # Flat / no domain: treat tech_dir itself as root.
+        imgs = _iter_images(tech_dir)
+        if imgs:
+            grouped = _group_by_video(imgs, tech_dir)
+            for vid_id, frame_paths in grouped.items():
+                for frame_idx, face_path in enumerate(frame_paths):
+                    rows.append(
+                        {
+                            "face_path": str(face_path),
+                            "frame_idx": frame_idx,
+                            "video_id": f"{technique}_{vid_id}",
+                            "label": label,
+                            "dataset": "df40",
+                            "generation": generation,
+                            "technique": technique,
+                        }
+                    )
+    if not rows:
+        logger.warning("Technique '%s' at %s produced 0 rows.", technique, tech_dir)
     return rows
 
 
-def _borrow_real_rows(
-    source_csv: Path,
+def catalog_df40_fakes(
+    dataset_root: Path,
     *,
-    target_generation: str,
+    techniques: list[str],
+    generation: str,
     logger,
 ) -> list[dict[str, Any]]:
-    """Pull real (``label == 0``) rows from an earlier generation's metadata."""
-    if not source_csv.is_file():
-        logger.warning(
-            "Borrow-real source not found: %s (continuing without real rows)",
-            source_csv,
+    """Enumerate DF40 fake face-crops for the requested technique list."""
+    rows: list[dict[str, Any]] = []
+    if not dataset_root.is_dir():
+        logger.error("DF40 fake root not found: %s", dataset_root)
+        return rows
+
+    # Build case-insensitive lookup of on-disk technique folders.
+    on_disk = {p.name.lower(): p for p in dataset_root.iterdir() if p.is_dir()}
+    for tech in techniques:
+        key = tech.lower()
+        if key not in on_disk:
+            logger.warning(
+                "Technique folder '%s' not found under %s — skipping.",
+                tech,
+                dataset_root,
+            )
+            continue
+        tech_dir = on_disk[key]
+        tech_rows = _catalog_technique_dir(
+            tech_dir,
+            technique=tech,
+            generation=generation,
+            label=1,
+            logger=logger,
         )
-        return []
-    df = pd.read_csv(source_csv)
-    real = df[df["label"] == 0].copy()
-    if real.empty:
-        logger.warning("No real rows in %s", source_csv)
-        return []
-    # Retag generation so downstream splits recognize these as gen3 real.
-    real["generation"] = target_generation
+        rows.extend(tech_rows)
+        logger.info("  technique=%s frames=%d", tech, len(tech_rows))
+    return rows
+
+
+def catalog_df40_reals(
+    real_root: Path,
+    *,
+    generation: str,
+    logger,
+) -> list[dict[str, Any]]:
+    """Enumerate DF40 shared real-face crops (labelled 0)."""
+    rows: list[dict[str, Any]] = []
+    if not real_root.is_dir():
+        logger.warning(
+            "DF40 real root not found: %s (no real frames added).", real_root
+        )
+        return rows
+
+    # Accept either `<real_root>/<source>/<video_id>/*.png`
+    # or `<real_root>/<video_id>/*.png`. We glob every image and let
+    # _group_by_video infer video_id from the parent.
+    imgs = _iter_images(real_root)
+    if not imgs:
+        logger.warning("No real images under %s", real_root)
+        return rows
+
+    grouped = _group_by_video(imgs, real_root)
+    for vid_id, frame_paths in grouped.items():
+        for frame_idx, face_path in enumerate(frame_paths):
+            rows.append(
+                {
+                    "face_path": str(face_path),
+                    "frame_idx": frame_idx,
+                    "video_id": f"real_{vid_id}",
+                    "label": 0,
+                    "dataset": "df40",
+                    "generation": generation,
+                    "technique": "real",
+                }
+            )
     logger.info(
-        "Borrowed %d real rows from %s (%d videos)",
-        len(real),
-        source_csv.name,
-        real["video_id"].nunique(),
+        "Real frames: %d (videos=%d) from %s",
+        len(rows),
+        len(grouped),
+        real_root,
     )
-    return real[list(_COLUMNS)].to_dict(orient="records")
+    return rows
 
 
-def _parse_techniques(text: str | None) -> set[str] | None:
+def _parse_techniques(text: str | None) -> list[str] | None:
     if not text:
         return None
-    techs = {item.strip() for item in text.split(",") if item.strip()}
+    techs = [item.strip() for item in text.split(",") if item.strip()]
     return techs or None
 
 
+def _resolve_techniques(
+    cli_techniques: list[str] | None,
+    cfg: dict[str, Any],
+    generation: str,
+) -> list[str]:
+    if cli_techniques:
+        return cli_techniques
+    gen_cfg = cfg["data"]["generations"].get(generation)
+    if not gen_cfg:
+        raise KeyError(
+            f"Generation '{generation}' missing from config "
+            f"(data.generations.{generation})."
+        )
+    techniques = gen_cfg.get("techniques")
+    if not techniques:
+        raise KeyError(
+            f"data.generations.{generation}.techniques is empty; "
+            "populate it in configs/default.yaml or pass --techniques."
+        )
+    return list(techniques)
+
+
 def _run(args: argparse.Namespace) -> int:
-    logger = get_logger("catalog_df40", log_file="runs/catalog_df40.log")
+    logger = get_logger(
+        "catalog_df40",
+        log_file=f"runs/catalog_df40_{args.generation}.log",
+    )
 
     cfg = load_config(args.config)
     drive_root = Path(cfg["paths"]["drive_root"])
@@ -179,47 +311,41 @@ def _run(args: argparse.Namespace) -> int:
         if args.df40_root
         else drive_root / "datasets" / "raw" / "df40"
     )
-    if not df40_root.is_dir():
-        logger.error(
-            "DF40 root not found: %s. Download via gdown folder first.", df40_root
-        )
-        return 1
-
-    allow_techniques = _parse_techniques(args.techniques)
-    domains = tuple(d.strip() for d in args.domains.split(",") if d.strip())
-    logger.info(
-        "Scanning DF40 at %s (techniques=%s domains=%s)",
-        df40_root,
-        sorted(allow_techniques) if allow_techniques else "all",
-        list(domains),
+    real_root = (
+        Path(args.real_root)
+        if args.real_root
+        else drive_root / "datasets" / "raw" / "df40_real"
     )
 
-    fake_rows = catalog_df40_preprocessed(
-        df40_root, allow_techniques=allow_techniques, domains=domains
+    techniques = _resolve_techniques(
+        _parse_techniques(args.techniques), cfg, args.generation
+    )
+    logger.info(
+        "Cataloging DF40 generation=%s techniques=%s",
+        args.generation,
+        techniques,
+    )
+
+    fake_rows = catalog_df40_fakes(
+        df40_root,
+        techniques=techniques,
+        generation=args.generation,
+        logger=logger,
     )
     if not fake_rows:
         logger.error(
-            "No DF40 images found under %s (checked extensions %s). "
-            "Verify download completed.",
+            "No DF40 fake images found under %s for techniques %s. "
+            "Verify download completed and folder names match.",
             df40_root,
-            list(_IMAGE_EXTS),
+            techniques,
         )
         return 2
-
-    # Summary per technique for sanity check.
-    counts: dict[str, int] = {}
-    for r in fake_rows:
-        counts[r["technique"]] = counts.get(r["technique"], 0) + 1
-    for tech, n in sorted(counts.items()):
-        logger.info("  technique=%s frames=%d", tech, n)
     logger.info("DF40 fake rows total: %d", len(fake_rows))
 
     real_rows: list[dict[str, Any]] = []
-    if args.borrow_real_from:
-        faces_dir = drive_root / "datasets" / "faces"
-        source_csv = faces_dir / f"metadata_{args.borrow_real_from}.csv"
-        real_rows = _borrow_real_rows(
-            source_csv, target_generation=args.generation, logger=logger
+    if not args.no_real:
+        real_rows = catalog_df40_reals(
+            real_root, generation=args.generation, logger=logger
         )
 
     all_rows = real_rows + fake_rows
@@ -245,54 +371,48 @@ def _run(args: argparse.Namespace) -> int:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Catalog DF40 preprocessed face images for gen3"
+        description=(
+            "Catalog DF40 preprocessed face images into a "
+            "metadata_<generation>.csv for downstream splits/training."
+        )
     )
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument(
         "--generation",
-        default="gen3",
-        help="Generation tag to write (default: gen3)",
+        required=True,
+        choices=["gen1", "gen2", "gen3"],
+        help="Generation bucket to build. Techniques come from "
+        "data.generations.<gen>.techniques in the YAML config.",
     )
     p.add_argument(
         "--df40-root",
         default=None,
-        help="Override {drive}/datasets/raw/df40",
+        help="Override {drive}/datasets/raw/df40 (fake crops).",
+    )
+    p.add_argument(
+        "--real-root",
+        default=None,
+        help="Override {drive}/datasets/raw/df40_real (real crops).",
     )
     p.add_argument(
         "--techniques",
         default=None,
         help=(
-            "Comma-separated technique folder names to keep "
-            "(e.g. 'sd_2_1,ddpm,rddm'). Default: all folders under df40/."
+            "Comma-separated technique folders (e.g. 'sd2.1,ddim,PixArt'). "
+            "If omitted, read from config."
         ),
     )
     p.add_argument(
-        "--domains",
-        default="ff,cdf",
-        help="Comma-separated DF40 domains to include (default: ff,cdf)",
-    )
-    p.add_argument(
-        "--borrow-real-from",
-        default="gen1",
-        help=(
-            "Source generation tag to borrow REAL rows from "
-            "(default: gen1). Pass empty string to disable."
-        ),
-    )
-    p.add_argument(
-        "--no-borrow-real",
+        "--no-real",
         action="store_true",
-        help="Shortcut for --borrow-real-from '' (only DF40 fakes)",
+        help="Skip cataloging real-face crops (write only DF40 fakes).",
     )
     p.add_argument(
         "--output",
         default=None,
-        help="Override output metadata CSV path",
+        help="Override output metadata CSV path.",
     )
-    args = p.parse_args()
-    if args.no_borrow_real:
-        args.borrow_real_from = ""
-    return args
+    return p.parse_args()
 
 
 if __name__ == "__main__":

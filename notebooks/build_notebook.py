@@ -1,0 +1,312 @@
+"""One-shot generator for notebooks/colab_run_all.ipynb.
+
+Run from repo root:   python notebooks/build_notebook.py
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+
+def md(text: str) -> dict:
+    return {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": text.splitlines(keepends=True),
+    }
+
+
+def code(text: str) -> dict:
+    return {
+        "cell_type": "code",
+        "metadata": {},
+        "source": text.splitlines(keepends=True),
+        "outputs": [],
+        "execution_count": None,
+    }
+
+
+CELLS: list[dict] = []
+
+CELLS.append(md(
+    "# CKD-Deepfake — End-to-End Colab Pipeline\n"
+    "\n"
+    "Thesis: **Continual Knowledge Distillation for Cross-Generational Deepfake Detection on Edge Devices**.\n"
+    "\n"
+    "This notebook runs the full pipeline on Google Colab with a single A100/T4 GPU:\n"
+    "\n"
+    "1. Mount Drive + clone private repo\n"
+    "2. Download DF40 (fake crops) + DF40 real crops + teacher weights\n"
+    "3. Catalog DF40 into `metadata_<gen>.csv` (gen1 = classic face-swap, gen2 = reenactment, gen3 = diffusion/modern)\n"
+    "4. Generate splits + ensemble soft labels\n"
+    "5. Initial distillation on gen1, then continual distillation on gen2 → gen3\n"
+    "6. Edge evaluation (TFLite fp32/fp16/int8) + generate figures\n"
+    "\n"
+    "**Dataset choice.** All three generations come from the **DF40 dataset** — it bundles 40 techniques covering "
+    "classic face-swap → reenactment → modern diffusion. One dataset, consistent face-crop format (224×224), "
+    "no per-video face extraction required.\n"
+))
+
+CELLS.append(md("## 0. Sanity check: GPU + Python"))
+CELLS.append(code(
+    "!nvidia-smi || echo 'No GPU — switch runtime to GPU before running.'\n"
+    "import sys, platform\n"
+    "print('Python:', sys.version)\n"
+    "print('Platform:', platform.platform())\n"
+))
+
+CELLS.append(md("## 1. Mount Google Drive"))
+CELLS.append(code(
+    "from google.colab import drive\n"
+    "drive.mount('/content/drive')\n"
+    "\n"
+    "from pathlib import Path\n"
+    "DRIVE_ROOT = Path('/content/drive/MyDrive/CKD_Thesis')\n"
+    "DRIVE_ROOT.mkdir(parents=True, exist_ok=True)\n"
+    "for sub in ['datasets/raw', 'datasets/faces', 'datasets/splits',\n"
+    "            'checkpoints/teachers', 'checkpoints/student',\n"
+    "            'soft_labels', 'runs', 'results', 'figures']:\n"
+    "    (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)\n"
+    "print('Drive root:', DRIVE_ROOT)\n"
+))
+
+CELLS.append(md(
+    "## 2. Clone the repository\n"
+    "\n"
+    "The repo is private. You'll need a [GitHub personal access token](https://github.com/settings/tokens) "
+    "with `repo` scope. It's only used to clone and is not stored.\n"
+))
+CELLS.append(code(
+    "import getpass, os, subprocess\n"
+    "from pathlib import Path\n"
+    "\n"
+    "REPO_USER = 'tesisbright123-blip'\n"
+    "REPO_NAME = 'ckd-deepfake'\n"
+    "REPO_DIR  = Path('/content') / REPO_NAME\n"
+    "\n"
+    "if not REPO_DIR.exists():\n"
+    "    token = getpass.getpass('GitHub token (repo scope): ').strip()\n"
+    "    url = f'https://{REPO_USER}:{token}@github.com/{REPO_USER}/{REPO_NAME}.git'\n"
+    "    subprocess.run(['git', 'clone', '--depth', '1', url, str(REPO_DIR)], check=True)\n"
+    "    del token\n"
+    "else:\n"
+    "    subprocess.run(['git', '-C', str(REPO_DIR), 'pull', '--ff-only'], check=False)\n"
+    "\n"
+    "os.chdir(REPO_DIR)\n"
+    "print('Working dir:', os.getcwd())\n"
+    "!ls\n"
+))
+
+CELLS.append(md("## 3. Install dependencies"))
+CELLS.append(code(
+    "!pip install -q -r requirements.txt\n"
+    "!pip install -q gdown tqdm\n"
+))
+
+CELLS.append(md(
+    "## 4. Download DF40 to Drive (one-time, ~50 GB)\n"
+    "\n"
+    "DF40 is published as a Google Drive folder. We mirror it under "
+    "`{DRIVE_ROOT}/datasets/raw/df40` (fakes) and "
+    "`{DRIVE_ROOT}/datasets/raw/df40_real` (real crops).\n"
+    "\n"
+    "**Fill in the folder IDs below from the [DF40 README](https://github.com/YZY-stack/DF40).** "
+    "They change occasionally; grab the latest `gdown --folder <id>` IDs for the training set and the "
+    "FF-real / CDF-real companion folders.\n"
+    "\n"
+    "The cell is idempotent — skip it after the first successful run.\n"
+))
+CELLS.append(code(
+    "import os\n"
+    "from pathlib import Path\n"
+    "\n"
+    "DF40_FAKE_FOLDER_ID = ''   # <-- paste DF40 training folder ID\n"
+    "DF40_REAL_FOLDER_ID = ''   # <-- paste DF40 real-crops folder ID (ff_real + cdf_real)\n"
+    "\n"
+    "df40_root      = Path('/content/drive/MyDrive/CKD_Thesis/datasets/raw/df40')\n"
+    "df40_real_root = Path('/content/drive/MyDrive/CKD_Thesis/datasets/raw/df40_real')\n"
+    "df40_root.mkdir(parents=True, exist_ok=True)\n"
+    "df40_real_root.mkdir(parents=True, exist_ok=True)\n"
+    "\n"
+    "if DF40_FAKE_FOLDER_ID and not any(df40_root.iterdir()):\n"
+    "    !gdown --folder https://drive.google.com/drive/folders/$DF40_FAKE_FOLDER_ID -O $df40_root --remaining-ok\n"
+    "else:\n"
+    "    print('DF40 fake root already populated or ID missing — skipping.')\n"
+    "\n"
+    "if DF40_REAL_FOLDER_ID and not any(df40_real_root.iterdir()):\n"
+    "    !gdown --folder https://drive.google.com/drive/folders/$DF40_REAL_FOLDER_ID -O $df40_real_root --remaining-ok\n"
+    "else:\n"
+    "    print('DF40 real root already populated or ID missing — skipping.')\n"
+    "\n"
+    "print('\\nDF40 fake techniques present:')\n"
+    "!ls $df40_root | head -50\n"
+    "print('\\nDF40 real tree:')\n"
+    "!ls $df40_real_root | head -20\n"
+))
+
+CELLS.append(md(
+    "## 5. Download teacher checkpoints\n"
+    "\n"
+    "Three teachers: EfficientNet-B4 (DeepfakeBench), Recce (DeepfakeBench), CLIP ViT-L/14 "
+    "(CLIPping). Expected layout after this cell:\n"
+    "\n"
+    "```\n"
+    "{DRIVE_ROOT}/checkpoints/teachers/\n"
+    "    efficientnet_b4.pth\n"
+    "    recce.pth\n"
+    "    clip_clipping.pth\n"
+    "```\n"
+    "\n"
+    "If you already uploaded them manually, this cell is a no-op.\n"
+))
+CELLS.append(code(
+    "from pathlib import Path\n"
+    "teachers_dir = Path('/content/drive/MyDrive/CKD_Thesis/checkpoints/teachers')\n"
+    "teachers_dir.mkdir(parents=True, exist_ok=True)\n"
+    "\n"
+    "expected = ['efficientnet_b4.pth', 'recce.pth', 'clip_clipping.pth']\n"
+    "missing  = [f for f in expected if not (teachers_dir / f).exists()]\n"
+    "if missing:\n"
+    "    print('Missing teacher weights:', missing)\n"
+    "    print('Upload them to', teachers_dir, 'then re-run this cell.')\n"
+    "else:\n"
+    "    print('All teacher weights present.')\n"
+    "    !ls -la $teachers_dir\n"
+))
+
+CELLS.append(md(
+    "## 6. Catalog DF40 → `metadata_<gen>.csv`\n"
+    "\n"
+    "Technique lists per generation come from `configs/default.yaml`. The catalog script:\n"
+    "\n"
+    "- Walks every requested technique under `datasets/raw/df40/`, handles `ff/`, `cdf/`, `fake/` and "
+    "  flat layouts.\n"
+    "- Pulls real frames from `datasets/raw/df40_real/` and labels them 0.\n"
+    "- Writes the canonical 7-column metadata CSV consumed by step 02.\n"
+))
+CELLS.append(code(
+    "for gen in ['gen1', 'gen2', 'gen3']:\n"
+    "    print(f'=== Cataloging {gen} ===')\n"
+    "    !python scripts/01b_catalog_df40.py --config configs/default.yaml --generation $gen\n"
+    "\n"
+    "import pandas as pd\n"
+    "for gen in ['gen1', 'gen2', 'gen3']:\n"
+    "    p = f'/content/drive/MyDrive/CKD_Thesis/datasets/faces/metadata_{gen}.csv'\n"
+    "    df = pd.read_csv(p)\n"
+    "    print(f'{gen}: rows={len(df)} real={(df.label==0).sum()} fake={(df.label==1).sum()} '\n"
+    "          f'techniques={df.technique.nunique()}')\n"
+))
+
+CELLS.append(md("## 7. Generate 70/15/15 video-level splits"))
+CELLS.append(code(
+    "for gen in ['gen1', 'gen2', 'gen3']:\n"
+    "    !python scripts/02_generate_splits.py --config configs/default.yaml --generation $gen --seed 0\n"
+    "\n"
+    "!ls /content/drive/MyDrive/CKD_Thesis/datasets/splits/\n"
+))
+
+CELLS.append(md(
+    "## 8. Generate ensemble soft labels (teacher predictions)\n"
+    "\n"
+    "Runs all three teachers over train/val frames per generation and caches the softmax average. "
+    "Slowest step in the pipeline — budget ~1 h per generation on A100.\n"
+))
+CELLS.append(code(
+    "for gen in ['gen1', 'gen2', 'gen3']:\n"
+    "    print(f'=== Soft labels for {gen} ===')\n"
+    "    !python scripts/03_generate_soft_labels.py --config configs/default.yaml --generation $gen\n"
+))
+
+CELLS.append(md(
+    "## 9. (Optional) Mirror hot data to Colab local SSD\n"
+    "\n"
+    "Reading 100 k face crops from Drive is slow. If runtime disk has enough room, rsync the current "
+    "generation's frames + soft labels to `/content/ckd_local` before training.\n"
+))
+CELLS.append(code(
+    "import shutil\n"
+    "src = '/content/drive/MyDrive/CKD_Thesis'\n"
+    "dst = '/content/ckd_local'\n"
+    "# Flip to True to enable.\n"
+    "ENABLE_HOTDATA = False\n"
+    "if ENABLE_HOTDATA:\n"
+    "    !mkdir -p $dst/datasets $dst/soft_labels\n"
+    "    !rsync -a --info=progress2 $src/datasets/splits/ $dst/datasets/splits/\n"
+    "    !rsync -a --info=progress2 $src/soft_labels/ $dst/soft_labels/\n"
+    "    print('Done mirroring. Point --hotdata-root at', dst, 'if your training script supports it.')\n"
+    "else:\n"
+    "    print('Hotdata mirroring disabled.')\n"
+))
+
+CELLS.append(md("## 10. Initial distillation on gen1 (student = MobileNetV3-Large)"))
+CELLS.append(code(
+    "!python scripts/04_initial_distillation.py --config configs/default.yaml --generation gen1\n"
+))
+
+CELLS.append(md("## 11. Continual distillation: gen1 → gen2"))
+CELLS.append(code(
+    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/student/gen1_best.pth'\n"
+    "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
+    "    --generation gen2 --previous-checkpoint $PREV\n"
+))
+
+CELLS.append(md("## 12. Continual distillation: gen2 → gen3"))
+CELLS.append(code(
+    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/student/gen2_best.pth'\n"
+    "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
+    "    --generation gen3 --previous-checkpoint $PREV\n"
+))
+
+CELLS.append(md(
+    "## 13. Edge evaluation (TFLite fp32 / fp16 / int8)\n"
+    "\n"
+    "Converts each generation's best checkpoint to TFLite variants and benchmarks inference "
+    "latency + accuracy on the test split.\n"
+))
+CELLS.append(code(
+    "for gen in ['gen1', 'gen2', 'gen3']:\n"
+    "    !python scripts/07_edge_evaluation.py --config configs/default.yaml \\\n"
+    "        --generation $gen --modes fp32 fp16 int8 --num-runs 100\n"
+))
+
+CELLS.append(md("## 14. Generate thesis figures"))
+CELLS.append(code(
+    "!python scripts/08_generate_figures.py --config configs/default.yaml\n"
+    "!ls /content/drive/MyDrive/CKD_Thesis/figures\n"
+))
+
+CELLS.append(md(
+    "---\n"
+    "## Done 🎉\n"
+    "\n"
+    "Deliverables on Drive:\n"
+    "\n"
+    "- `checkpoints/student/gen{1,2,3}_best.pth` — student after each stage\n"
+    "- `results/edge_*.json` — TFLite latency/accuracy\n"
+    "- `figures/*.pdf` — thesis-ready plots (CDE, CGRS, S1–S3 heatmaps, latency bars)\n"
+))
+
+
+def main() -> None:
+    nb = {
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {"name": "python"},
+            "accelerator": "GPU",
+            "colab": {"provenance": [], "toc_visible": True},
+        },
+        "cells": CELLS,
+    }
+    out = Path(__file__).resolve().parent / "colab_run_all.ipynb"
+    out.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
+    print(f"Wrote {out} ({len(CELLS)} cells)")
+
+
+if __name__ == "__main__":
+    main()

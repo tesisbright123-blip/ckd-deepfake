@@ -43,23 +43,62 @@ data:
     horizontal_flip_p: 0.5
     brightness_contrast: 0.2
     shift_scale_rotate: [0.0625, 0.1, 10]
+  # NOTE: All three generations are now sourced from the DF40 dataset.
+  # DF40 bundles 40 techniques spanning the full deepfake history, so we
+  # partition it into three generational buckets. Each bucket also pulls
+  # REAL faces from DF40's shared real pool (borrow_real_from='df40_real').
   generations:
     gen1:
-      name: "Gen 1 (Autoencoder/GAN Awal)"
-      datasets: ["faceforensics_pp_c23"]
-      techniques: ["DeepFakes", "Face2Face", "FaceSwap", "NeuralTextures"]
+      name: "Gen 1 (Classic Face-Swap, pre-diffusion)"
+      datasets: ["df40"]
+      techniques:
+        - faceswap
+        - fsgan
+        - simswap
+        - deepfacelab
+        - inswap
+        - blendface
+        - uniface
+        - mobileswap
+        - e4s
+        - facedancer
       split_ratio: [0.7, 0.15, 0.15]
     gen2:
-      name: "Gen 2 (Advanced GAN)"
-      datasets: ["celeb_df_v2"]
-      techniques: ["Advanced GAN face-swap (Celeb-DF synthesis)"]
+      name: "Gen 2 (Face Reenactment / Talking-Head)"
+      datasets: ["df40"]
+      techniques:
+        - fomm
+        - facevid2vid
+        - wav2lip
+        - MRAA
+        - one_shot_free
+        - pirender
+        - tpsm
+        - lia
+        - danet
+        - sadtalker
+        - mcnet
+        - hyperreenact
+        - heygen
       split_ratio: [0.7, 0.15, 0.15]
     gen3:
-      name: "Gen 3 (Diffusion-based & Modern)"
-      datasets: ["df40_diffusion_subset", "deepfake_eval_2024"]
-      techniques: ["Diffusion-based face swap/inpainting", "Modern face-swap variants"]
+      name: "Gen 3 (Diffusion & Modern Entire-Face Synthesis)"
+      datasets: ["df40"]
+      techniques:
+        - sd2.1
+        - ddim
+        - PixArt
+        - DiT
+        - SiT
+        - MidJourney
+        - StyleGAN2
+        - StyleGAN3
+        - StyleGANXL
+        - VQGAN
+        - CollabDiff
+        - whichfaceisreal
       split_ratio: [0.7, 0.15, 0.15]
-      note: "DF40 untuk training volume; DeepFake-Eval-2024 untuk in-the-wild eval"
+      note: "Covers modern diffusion + StyleGAN-family entire-face synthesis."
 
 # ===== Training Config =====
 training:
