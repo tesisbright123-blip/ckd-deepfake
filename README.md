@@ -19,16 +19,22 @@ scratch:
 
 ## Generations
 
-| Gen  | Dataset              | Technique family           |
-|------|----------------------|----------------------------|
-| Gen1 | FaceForensics++      | autoencoder / early GAN    |
-| Gen2 | Celeb-DF-v2          | advanced GAN               |
-| Gen3 | DF40 + Eval-2024     | diffusion                  |
+All three generations are drawn from the [DF40 dataset](https://github.com/YZY-stack/DF40)
+(40 pre-cropped face techniques spanning the full deepfake history).
+DF40 ships face-aligned 224×224 crops directly, so no per-video face extraction is required.
+
+| Gen  | DF40 category                       | Example techniques                                 |
+|------|-------------------------------------|----------------------------------------------------|
+| Gen1 | Face-Swap (FS, classic)             | faceswap, fsgan, simswap, inswap, blendface, …    |
+| Gen2 | Face-Reenactment (FR, talking-head) | fomm, facevid2vid, wav2lip, sadtalker, heygen, …  |
+| Gen3 | Entire-Face Synthesis + diffusion   | sd2.1, ddim, DiT, SiT, PixArt, MidJourney, …      |
+
+See `configs/default.yaml -> data.generations` for the full per-gen technique list.
 
 ## Pipeline
 
 ```
-01_extract_faces         # .mp4 -> .jpg faces + metadata CSV
+01b_catalog_df40         # DF40 image tree -> metadata CSV (per generation)
 02_generate_splits       # 70/15/15 video-level splits
 03_generate_soft_labels  # teacher ensemble -> .npy
 04_initial_distillation  # student on Gen1
@@ -68,9 +74,12 @@ pytest tests/
 
 ### Colab (training)
 
-Open `notebooks/colab_setup.ipynb` and run all cells.
-Requires Colab Pro and a Google Drive folder at
-`/content/drive/MyDrive/CKD_Thesis/`.
+Open `notebooks/colab_run_all.ipynb` and *Runtime → Run all*.
+Requires Colab Pro (A100 recommended) and a Google Drive folder at
+`/content/drive/MyDrive/CKD_Thesis/`. The notebook downloads DF40
+(~55 GB) and teacher checkpoints on first run, then executes the full
+pipeline (catalog → splits → soft labels → initial & continual
+distillation → edge eval → figures).
 
 ## New metrics
 

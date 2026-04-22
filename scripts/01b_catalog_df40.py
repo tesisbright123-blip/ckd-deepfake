@@ -192,12 +192,19 @@ def catalog_df40_fakes(
     techniques: list[str],
     generation: str,
     logger,
-) -> list[dict[str, Any]]:
-    """Enumerate DF40 fake face-crops for the requested technique list."""
-    rows: list[dict[str, Any]] = []
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Enumerate DF40 fake face-crops for the requested technique list.
+
+    Returns ``(fake_rows, inline_real_rows)``. The second list contains real
+    frames that ship inside method folders (``<tech>/real/``) for the
+    9 "unknown" methods (MidJourney, stargan, starganv2, styleclip, e4e,
+    CollabDiff, whichfaceisreal).
+    """
+    fake_rows: list[dict[str, Any]] = []
+    inline_real_rows: list[dict[str, Any]] = []
     if not dataset_root.is_dir():
         logger.error("DF40 fake root not found: %s", dataset_root)
-        return rows
+        return fake_rows, inline_real_rows
 
     # Build case-insensitive lookup of on-disk technique folders.
     on_disk = {p.name.lower(): p for p in dataset_root.iterdir() if p.is_dir()}
@@ -211,16 +218,21 @@ def catalog_df40_fakes(
             )
             continue
         tech_dir = on_disk[key]
-        tech_rows = _catalog_technique_dir(
-            tech_dir,
-            technique=tech,
-            generation=generation,
-            label=1,
-            logger=logger,
+        f_rows = _catalog_technique_dir(
+            tech_dir, technique=tech, generation=generation, label=1, logger=logger,
         )
-        rows.extend(tech_rows)
-        logger.info("  technique=%s frames=%d", tech, len(tech_rows))
-    return rows
+        r_rows = _catalog_technique_dir(
+            tech_dir, technique=tech, generation=generation, label=0, logger=logger,
+        )
+        fake_rows.extend(f_rows)
+        inline_real_rows.extend(r_rows)
+        logger.info(
+            "  technique=%s fake_frames=%d inline_real_frames=%d",
+            tech,
+            len(f_rows),
+            len(r_rows),
+        )
+    return fake_rows, inline_real_rows
 
 
 def catalog_df40_reals(
@@ -326,7 +338,7 @@ def _run(args: argparse.Namespace) -> int:
         techniques,
     )
 
-    fake_rows = catalog_df40_fakes(
+    fake_rows, inline_real_rows = catalog_df40_fakes(
         df40_root,
         techniques=techniques,
         generation=args.generation,
@@ -340,15 +352,19 @@ def _run(args: argparse.Namespace) -> int:
             techniques,
         )
         return 2
-    logger.info("DF40 fake rows total: %d", len(fake_rows))
+    logger.info(
+        "DF40 fake rows total: %d  (inline-real rows: %d)",
+        len(fake_rows),
+        len(inline_real_rows),
+    )
 
-    real_rows: list[dict[str, Any]] = []
+    pooled_real_rows: list[dict[str, Any]] = []
     if not args.no_real:
-        real_rows = catalog_df40_reals(
+        pooled_real_rows = catalog_df40_reals(
             real_root, generation=args.generation, logger=logger
         )
 
-    all_rows = real_rows + fake_rows
+    all_rows = inline_real_rows + pooled_real_rows + fake_rows
     output_path = (
         Path(args.output)
         if args.output
