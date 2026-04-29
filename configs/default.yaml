@@ -144,8 +144,11 @@ evaluation:
   scenarios: [S1, S2, S3]
 
 # ===== Edge Deployment Config =====
+# Mode names must match SUPPORTED_MODES in src/evaluation/edge_eval.py
+# ("fp32" / "fp16" / "int8" — "float16" was the legacy spelling and is
+# rejected by the CLI parser in scripts/07_edge_evaluation.py).
 edge:
-  tflite_quantization: [float16, int8]
+  tflite_quantization: [fp32, fp16, int8]
   benchmark_num_runs: 100
 
 # ===== Paths (template, filled at runtime) =====

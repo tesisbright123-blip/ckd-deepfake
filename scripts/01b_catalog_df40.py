@@ -135,13 +135,9 @@ def _catalog_technique_dir(
     if not tech_dir.is_dir():
         return rows
 
-    domains_present = [
-        d
-        for d in _FAKE_DOMAINS
-        if (tech_dir / d).is_dir()
-    ] if label == 1 else [
-        d for d in _REAL_DOMAINS_IN_TECH if (tech_dir / d).is_dir()
-    ]
+    fake_domains = [d for d in _FAKE_DOMAINS if (tech_dir / d).is_dir()]
+    real_domains = [d for d in _REAL_DOMAINS_IN_TECH if (tech_dir / d).is_dir()]
+    domains_present = fake_domains if label == 1 else real_domains
 
     if domains_present:
         for domain in domains_present:
@@ -163,26 +159,38 @@ def _catalog_technique_dir(
                             "technique": technique,
                         }
                     )
-    else:
-        # Flat / no domain: treat tech_dir itself as root.
-        imgs = _iter_images(tech_dir)
-        if imgs:
-            grouped = _group_by_video(imgs, tech_dir)
-            for vid_id, frame_paths in grouped.items():
-                for frame_idx, face_path in enumerate(frame_paths):
-                    rows.append(
-                        {
-                            "face_path": str(face_path),
-                            "frame_idx": frame_idx,
-                            "video_id": f"{technique}_{vid_id}",
-                            "label": label,
-                            "dataset": "df40",
-                            "generation": generation,
-                            "technique": technique,
-                        }
-                    )
-    if not rows:
-        logger.warning("Technique '%s' at %s produced 0 rows.", technique, tech_dir)
+        return rows
+
+    # Flat fallback only applies when NO domain dirs (ff/cdf/fake/real) exist
+    # under this tech. Otherwise we'd accidentally re-walk fake images as real
+    # (or vice versa) for techniques like faceswap that use ff/cdf with no
+    # explicit real/ subdir — those should yield zero inline-real rows here.
+    if fake_domains or real_domains:
+        return rows
+
+    # Truly flat layout: only emit for label=1 (we don't have a way to tell
+    # real-only flat layouts apart from fake-only ones).
+    if label != 1:
+        return rows
+
+    imgs = _iter_images(tech_dir)
+    if imgs:
+        grouped = _group_by_video(imgs, tech_dir)
+        for vid_id, frame_paths in grouped.items():
+            for frame_idx, face_path in enumerate(frame_paths):
+                rows.append(
+                    {
+                        "face_path": str(face_path),
+                        "frame_idx": frame_idx,
+                        "video_id": f"{technique}_{vid_id}",
+                        "label": label,
+                        "dataset": "df40",
+                        "generation": generation,
+                        "technique": technique,
+                    }
+                )
+    if not rows and label == 1:
+        logger.warning("Technique '%s' at %s produced 0 fake rows.", technique, tech_dir)
     return rows
 
 

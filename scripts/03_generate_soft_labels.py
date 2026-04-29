@@ -284,6 +284,31 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # Make any silent teacher fallback visible at the end of the run.
+    requested_set = set(requested)
+    succeeded_set = set(per_teacher_soft.keys())
+    skipped = sorted(requested_set - succeeded_set)
+    if skipped:
+        logger.warning(
+            "================================================================"
+        )
+        logger.warning(
+            "TEACHER FALLBACK: %d/%d teachers loaded. Skipped: %s",
+            len(succeeded_set),
+            len(requested_set),
+            skipped,
+        )
+        logger.warning(
+            "Soft labels for %s will be a %d-teacher ensemble. If you want "
+            "all requested teachers in the ensemble, fix the load errors "
+            "above (check checkpoint paths and dependencies) and re-run.",
+            args.generation,
+            len(succeeded_set),
+        )
+        logger.warning(
+            "================================================================"
+        )
+
     # --- Weight teachers by val AUC ------------------------------------
     val_labels = _load_val_labels(split_csvs["val"])
     per_teacher_auc = {
