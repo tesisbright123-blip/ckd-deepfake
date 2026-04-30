@@ -62,23 +62,64 @@ def softmax_weights(
     per_teacher_auc: dict[str, float],
     *,
     temperature: float = 1.0,
+    method: str = "excess_auc",
 ) -> dict[str, float]:
-    """Turn per-teacher val AUCs into a softmax weighting.
+    """Turn per-teacher val AUCs into ensemble weights.
+
+    Two strategies are supported:
+
+    ``method="excess_auc"`` (default, recommended):
+        Each teacher gets weight ``max(0, AUC - 0.5)`` normalised to sum to 1.
+        This penalises teachers whose val AUC is at-or-below random (filters
+        them out entirely) and scales meaningfully across the practical AUC
+        range [0.5, 1.0]. Robust to the narrow-range issue that plagues
+        plain softmax over AUCs (where AUCs in [0.85, 0.92] produce near-
+        uniform weights at T=1.0).
+
+    ``method="softmax"``:
+        Legacy: ``softmax(AUC / temperature)``. Kept for backwards
+        compatibility and reproducibility of older runs. Note that with
+        ``temperature=1.0`` and AUCs in the typical [0.8, 0.95] range, the
+        weights are within ~0.03 of uniform — i.e. ensemble weighting has
+        almost no effect.
 
     Args:
         per_teacher_auc: Mapping ``teacher_name -> val_auc``.
-        temperature: Lower values = sharper weighting toward the best
-            teacher. Default 1.0 is a simple softmax over raw AUCs.
+        temperature: Only used when ``method="softmax"``. Lower values
+            = sharper weighting toward the best teacher.
+        method: ``"excess_auc"`` (default) or ``"softmax"``.
+
+    Returns:
+        ``teacher_name -> weight`` mapping summing to 1.0. If every teacher
+        has AUC <= 0.5 under ``excess_auc``, the function falls back to
+        uniform weights with a warning.
     """
     if not per_teacher_auc:
         raise ValueError("per_teacher_auc must not be empty")
     names = list(per_teacher_auc.keys())
     aucs = np.array([per_teacher_auc[n] for n in names], dtype=np.float64)
-    scaled = aucs / max(temperature, 1e-6)
-    # Numerical-stability shift.
-    scaled = scaled - scaled.max()
-    exp = np.exp(scaled)
-    weights = exp / exp.sum()
+
+    if method == "excess_auc":
+        excess = np.maximum(aucs - 0.5, 0.0)
+        total = excess.sum()
+        if total <= 0:
+            logger.warning(
+                "All teachers have AUC <= 0.5 — falling back to uniform ensemble weights."
+            )
+            weights = np.full_like(aucs, 1.0 / len(aucs))
+        else:
+            weights = excess / total
+    elif method == "softmax":
+        scaled = aucs / max(temperature, 1e-6)
+        scaled = scaled - scaled.max()
+        exp = np.exp(scaled)
+        weights = exp / exp.sum()
+    else:
+        raise ValueError(
+            f"Unknown ensemble weighting method: {method!r} "
+            f"(expected 'excess_auc' or 'softmax')"
+        )
+
     return {name: float(w) for name, w in zip(names, weights)}
 
 
@@ -118,6 +159,7 @@ def build_and_save_ensemble(
     output_dir: str | Path,
     generation: str,
     weighting_temperature: float = 1.0,
+    weighting_method: str = "excess_auc",
 ) -> tuple[Path, Path]:
     """End-to-end: compute weights, aggregate, write .npy + .json.
 
@@ -146,7 +188,9 @@ def build_and_save_ensemble(
             for name, arr in per_teacher_soft.items()
         }
         weights = softmax_weights(
-            per_teacher_auc, temperature=weighting_temperature
+            per_teacher_auc,
+            temperature=weighting_temperature,
+            method=weighting_method,
         )
     else:
         logger.warning(

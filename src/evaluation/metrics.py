@@ -130,3 +130,51 @@ def compute_cgrs(
             )
         ratios.append(float(auc_now) / float(peak))
     return float(np.mean(ratios))
+
+
+def compute_average_forgetting(
+    auc_after: dict[str, float],
+    auc_peak: dict[str, float],
+    *,
+    exclude_current: str | None = None,
+) -> float:
+    """Average Forgetting (Chaudhry et al. 2018) — companion to CGRS.
+
+    Defined as the mean drop in AUC between each generation's peak and its
+    current value::
+
+        AvgF = (1/N) * sum_g ( auc_peak[g] - auc_after[g] )
+
+    Standard CL-literature metric, complements CGRS by reporting the absolute
+    AUC degradation rather than the ratio. Positive values = forgetting;
+    zero = no forgetting; negative = improvement (positive backward transfer).
+
+    Args:
+        auc_after: ``gen_id -> AUC`` measured after the final round.
+        auc_peak:  ``gen_id -> AUC`` measured at each gen's peak.
+        exclude_current: Optional gen id to skip (the gen we just trained on,
+            which by definition isn't being forgotten). When ``None`` all
+            generations in ``auc_after`` are included.
+
+    Returns:
+        Mean forgetting across the included generations. Convention: forgetting
+        averaged over PREVIOUS generations only is the more common form in
+        CL papers, but we leave the choice to the caller via ``exclude_current``.
+    """
+    if not auc_after:
+        raise ValueError("auc_after must not be empty")
+
+    drops: list[float] = []
+    for gen_id, auc_now in auc_after.items():
+        if exclude_current is not None and gen_id == exclude_current:
+            continue
+        peak = auc_peak.get(gen_id)
+        if peak is None:
+            raise ValueError(
+                f"Missing peak AUC for generation '{gen_id}'"
+            )
+        drops.append(float(peak) - float(auc_now))
+    if not drops:
+        # All generations were excluded — return 0 (no prior gens to forget).
+        return 0.0
+    return float(np.mean(drops))

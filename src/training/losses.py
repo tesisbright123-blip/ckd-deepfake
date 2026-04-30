@@ -137,11 +137,37 @@ class ContinualDistillationLoss(nn.Module):
     distribution is the *previous* student's output (passed in as logits by the
     LwF / replay orchestrator in :mod:`src.training.continual_trainer`).
 
+    Effective-weight renormalisation
+    --------------------------------
+    When the active anti-forgetting strategy does not provide previous-student
+    logits (EWC, plain Replay) the retention term is zero on every batch. Naively
+    keeping ``beta`` non-zero in that case would mean the loss carries only
+    ``alpha + gamma`` of total weight and EWC/Replay implicitly receive a 30%
+    smaller update step than LwF — making the cross-method ablation unfair.
+
+    To keep methods apples-to-apples we **detect at construction time** whether
+    a retention-providing strategy will be used (via ``has_retention``) and
+    renormalise ``alpha`` and ``gamma`` to sum to 1 when retention is off:
+
+        if not has_retention:
+            alpha_eff = alpha / (alpha + gamma)
+            gamma_eff = gamma / (alpha + gamma)
+            beta_eff  = 0.0
+
+    so EWC/Replay gets the same total loss magnitude as LwF.
+
     Args:
         alpha: Weight on the teacher KD term.
         beta:  Weight on the previous-student retention term.
         gamma: Weight on the hard-label CE term.
-        temperature: Shared softmax temperature for KD and retention.
+        temperature: Softmax temperature for the teacher KD term.
+        retention_temperature: Separate temperature for the retention term
+            (LwF, Li & Hoiem 2017, used T=2). If ``None`` the same temperature
+            as the teacher KD term is used.
+        has_retention: Whether the active strategy will supply
+            ``previous_student_logits`` on every batch. When ``False`` (e.g.
+            EWC, plain Replay) ``alpha`` and ``gamma`` are renormalised so the
+            two-term loss carries unit total weight.
     """
 
     def __init__(
@@ -150,6 +176,8 @@ class ContinualDistillationLoss(nn.Module):
         beta: float = 0.3,
         gamma: float = 0.2,
         temperature: float = 4.0,
+        retention_temperature: float | None = None,
+        has_retention: bool = True,
     ) -> None:
         super().__init__()
         for name, value in (("alpha", alpha), ("beta", beta), ("gamma", gamma)):
@@ -157,10 +185,33 @@ class ContinualDistillationLoss(nn.Module):
                 raise ValueError(f"{name} must be >= 0, got {value}")
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {temperature}")
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-        self.gamma = float(gamma)
+        if retention_temperature is not None and retention_temperature <= 0:
+            raise ValueError(
+                f"retention_temperature must be > 0, got {retention_temperature}"
+            )
+
+        if has_retention:
+            self.alpha = float(alpha)
+            self.beta = float(beta)
+            self.gamma = float(gamma)
+        else:
+            denom = float(alpha + gamma)
+            if denom <= 0:
+                raise ValueError(
+                    "When has_retention=False, alpha + gamma must be > 0 "
+                    f"(got alpha={alpha}, gamma={gamma})"
+                )
+            self.alpha = float(alpha) / denom
+            self.beta = 0.0
+            self.gamma = float(gamma) / denom
+
         self.temperature = float(temperature)
+        self.retention_temperature = (
+            float(retention_temperature)
+            if retention_temperature is not None
+            else float(temperature)
+        )
+        self.has_retention = bool(has_retention)
         self.ce = nn.CrossEntropyLoss()
 
     def forward(
@@ -193,9 +244,12 @@ class ContinualDistillationLoss(nn.Module):
 
         if previous_student_logits is not None and self.beta > 0.0:
             prev_prob = F.softmax(
-                previous_student_logits.detach() / self.temperature, dim=1
+                previous_student_logits.detach() / self.retention_temperature,
+                dim=1,
             )
-            retention_loss = _kd_kl(student_logits, prev_prob, self.temperature)
+            retention_loss = _kd_kl(
+                student_logits, prev_prob, self.retention_temperature
+            )
         else:
             retention_loss = student_logits.new_zeros(())
 

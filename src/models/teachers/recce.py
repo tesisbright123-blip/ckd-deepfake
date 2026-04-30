@@ -137,13 +137,7 @@ class RECCETeacher(BaseTeacher):
     def get_preprocessing(self) -> A.Compose:
         return A.Compose(
             [
-                A.LongestMaxSize(max_size=self.input_size),
-                A.PadIfNeeded(
-                    min_height=self.input_size,
-                    min_width=self.input_size,
-                    border_mode=0,
-                    value=0,
-                ),
+                A.Resize(height=self.input_size, width=self.input_size),
                 A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
                 ToTensorV2(),
             ]

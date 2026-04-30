@@ -23,13 +23,18 @@ Writes:
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 from torch.utils.data import DataLoader
 
 from src.evaluation.evaluator import evaluate_loader
@@ -37,6 +42,39 @@ from src.evaluation.metrics import BinaryMetrics
 from src.training.losses import DistillationLoss
 from src.utils.checkpoint import save_checkpoint
 from src.utils.logger import get_logger
+
+
+def _build_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    num_epochs: int,
+    warmup_epochs: int,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    """LinearLR warmup -> CosineAnnealingLR over the remaining epochs.
+
+    Falls back to plain cosine if the budget is too short for warmup.
+    """
+    num_epochs = max(int(num_epochs), 1)
+    warmup_epochs = max(int(warmup_epochs), 0)
+
+    if warmup_epochs == 0 or warmup_epochs >= num_epochs:
+        return CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    warmup = LinearLR(
+        optimizer,
+        start_factor=1.0e-3,  # avoid lr=0 at step 0 (kills AdamW momentum)
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs - warmup_epochs,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_epochs],
+    )
 
 
 @dataclass(frozen=True)
@@ -54,6 +92,10 @@ class TrainerConfig:
     early_stopping_patience: int = 5
     grad_clip_norm: float | None = 1.0
     log_every_n_steps: int = 50
+    # Linear warmup epochs before cosine annealing kicks in. Helps stabilise
+    # AdamW on a pretrained backbone — recommended by Goyal et al. 2017
+    # ("Accurate, Large Minibatch SGD") and Touvron et al. 2021 (DeiT).
+    warmup_epochs: int = 2
 
 
 @dataclass
@@ -124,13 +166,18 @@ class DistillationTrainer:
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=max(config.num_epochs, 1)
+        self.scheduler = _build_warmup_cosine_scheduler(
+            self.optimizer,
+            num_epochs=config.num_epochs,
+            warmup_epochs=config.warmup_epochs,
         )
 
         self.logger = get_logger(f"trainer.{generation}")
         self.best_val_auc: float = 0.0
         self.history: list[EpochStats] = []
+        # Wall-clock training cost — needed to compute CDE post-hoc.
+        self.elapsed_seconds: float = 0.0
+        self.gpu_hours: float = 0.0
 
     # ------------------------------------------------------------------ #
     #  Public entrypoint
@@ -140,6 +187,7 @@ class DistillationTrainer:
         self.model.to(self.device)
         patience = self.config.early_stopping_patience
         epochs_without_improvement = 0
+        start_time = time.perf_counter()
 
         for epoch in range(self.config.num_epochs):
             train_metrics = self._train_one_epoch(epoch)
@@ -193,6 +241,13 @@ class DistillationTrainer:
                 )
                 break
 
+        self.elapsed_seconds = float(time.perf_counter() - start_time)
+        self.gpu_hours = self.elapsed_seconds / 3600.0
+        self.logger.info(
+            "Training elapsed: %.1f s (%.3f GPU-hours)",
+            self.elapsed_seconds,
+            self.gpu_hours,
+        )
         return self.history
 
     # ------------------------------------------------------------------ #
@@ -261,5 +316,7 @@ class DistillationTrainer:
             metrics={
                 "val": metrics.as_dict(),
                 "history": [s.as_dict() for s in self.history],
+                "elapsed_seconds": float(self.elapsed_seconds),
+                "gpu_hours": float(self.gpu_hours),
             },
         )

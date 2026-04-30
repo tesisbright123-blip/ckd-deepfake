@@ -69,7 +69,12 @@ _DEFAULT_TEACHERS: tuple[str, ...] = (
     "recce",
     "clip_vit_l14",
 )
-_WEIGHTING_TEMPERATURE: float = 1.0
+# Default to excess-AUC normalisation: weight_i = max(0, AUC_i - 0.5)
+# normalised to sum 1. Filters teachers below random and gives meaningful
+# spread across the practical AUC range — unlike plain softmax over AUCs
+# which is nearly uniform at T=1.0.
+_WEIGHTING_METHOD: str = "excess_auc"
+_WEIGHTING_TEMPERATURE: float = 1.0  # only used if _WEIGHTING_METHOD == "softmax"
 
 
 # ---------------------------------------------------------------------- #
@@ -316,7 +321,9 @@ def _run(args: argparse.Namespace) -> int:
         for name, splits in per_teacher_soft.items()
     }
     weights = softmax_weights(
-        per_teacher_auc, temperature=_WEIGHTING_TEMPERATURE
+        per_teacher_auc,
+        temperature=_WEIGHTING_TEMPERATURE,
+        method=_WEIGHTING_METHOD,
     )
     logger.info("Per-teacher val AUC: %s", {k: round(v, 4) for k, v in per_teacher_auc.items()})
     logger.info("Ensemble weights:   %s", {k: round(v, 4) for k, v in weights.items()})
@@ -346,6 +353,7 @@ def _run(args: argparse.Namespace) -> int:
         "teachers_used": list(per_teacher_soft.keys()),
         "weights": weights,
         "val_auc": per_teacher_auc,
+        "weighting_method": _WEIGHTING_METHOD,
         "weighting_temperature": _WEIGHTING_TEMPERATURE,
         "num_samples_per_split": num_samples_per_split,
     }

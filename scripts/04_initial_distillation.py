@@ -239,6 +239,8 @@ def _run(args: argparse.Namespace) -> int:
         extra={
             "checkpoint_path": str(checkpoint_dir / "best.pth"),
             "best_val_auc": float(trainer.best_val_auc),
+            "elapsed_seconds": float(getattr(trainer, "elapsed_seconds", 0.0)),
+            "gpu_hours": float(getattr(trainer, "gpu_hours", 0.0)),
             "use_soft_labels": use_soft,
             "seed": args.seed,
         },

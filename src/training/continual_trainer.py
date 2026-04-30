@@ -30,19 +30,20 @@ Writes:
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from src.evaluation.evaluator import evaluate_loader
 from src.evaluation.metrics import BinaryMetrics
 from src.training.anti_forgetting.base import AntiForgettingStrategy
 from src.training.losses import ContinualDistillationLoss
+from src.training.trainer import _build_warmup_cosine_scheduler
 from src.utils.checkpoint import save_checkpoint
 from src.utils.logger import get_logger
 
@@ -64,6 +65,9 @@ class ContinualTrainerConfig:
     early_stopping_patience: int = 3
     grad_clip_norm: float | None = 1.0
     log_every_n_steps: int = 50
+    # Linear warmup epochs before cosine annealing kicks in. 1 is enough for
+    # short continual rounds (10 epochs); 0 disables warmup.
+    warmup_epochs: int = 1
 
 
 @dataclass
@@ -132,24 +136,38 @@ class ContinualTrainer:
         if self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        # Detect whether the strategy supplies previous-student logits on
+        # every batch. EWC and plain Replay don't — without renormalisation
+        # alpha+beta+gamma=1 collapses to alpha+gamma=0.7, making EWC/Replay
+        # implicitly receive 30% less gradient than LwF and breaking the
+        # cross-method ablation.
+        has_retention = bool(getattr(strategy, "provides_retention_logits", False))
+        retention_temp = getattr(strategy, "retention_temperature", None)
         self.loss_fn = ContinualDistillationLoss(
             alpha=config.alpha,
             beta=config.beta,
             gamma=config.gamma,
             temperature=config.temperature,
+            retention_temperature=retention_temp,
+            has_retention=has_retention,
         )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
         )
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=max(config.num_epochs, 1)
+        self.scheduler = _build_warmup_cosine_scheduler(
+            self.optimizer,
+            num_epochs=config.num_epochs,
+            warmup_epochs=config.warmup_epochs,
         )
 
         self.logger = get_logger(f"continual_trainer.{generation}.{strategy.name}")
         self.best_val_auc: float = 0.0
         self.history: list[ContinualEpochStats] = []
+        # Wall-clock training cost — needed to compute CDE post-hoc.
+        self.elapsed_seconds: float = 0.0
+        self.gpu_hours: float = 0.0
 
     # ------------------------------------------------------------------ #
     #  Public entrypoint
@@ -162,6 +180,7 @@ class ContinualTrainer:
 
         patience = self.config.early_stopping_patience
         epochs_without_improvement = 0
+        start_time = time.perf_counter()
 
         for epoch in range(self.config.num_epochs):
             train_metrics = self._train_one_epoch(epoch, train_loader)
@@ -217,6 +236,14 @@ class ContinualTrainer:
                     self.best_val_auc,
                 )
                 break
+
+        self.elapsed_seconds = float(time.perf_counter() - start_time)
+        self.gpu_hours = self.elapsed_seconds / 3600.0
+        self.logger.info(
+            "Continual training elapsed: %.1f s (%.3f GPU-hours)",
+            self.elapsed_seconds,
+            self.gpu_hours,
+        )
 
         # Let strategies free GPU memory (e.g. LwF's frozen model).
         self.strategy.after_training(self.model)
@@ -314,5 +341,7 @@ class ContinualTrainer:
             metrics={
                 "val": metrics.as_dict(),
                 "history": [s.as_dict() for s in self.history],
+                "elapsed_seconds": float(self.elapsed_seconds),
+                "gpu_hours": float(self.gpu_hours),
             },
         )

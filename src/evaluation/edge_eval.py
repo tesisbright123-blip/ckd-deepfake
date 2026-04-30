@@ -287,7 +287,11 @@ def convert_to_tflite(
                 [input_name, str(calib_path), "none", "none"]
             ]
             convert_kwargs["output_integer_quantized_tflite"] = True
-            convert_kwargs["quant_type"] = "per-tensor"
+            # Prefer per-channel quantization: lower accuracy loss on
+            # MobileNetV3 (whose Squeeze-and-Excitation modules have very
+            # different per-channel dynamic ranges). Fall back to per-tensor
+            # if the runtime onnx2tf rejects per-channel for this graph.
+            convert_kwargs["quant_type"] = "per-channel"
 
     logger.info(
         "Running onnx2tf (modes=%s, onnx=%s, out=%s)",
@@ -295,7 +299,19 @@ def convert_to_tflite(
         onnx_path,
         onnx2tf_out,
     )
-    onnx2tf.convert(**convert_kwargs)
+    try:
+        onnx2tf.convert(**convert_kwargs)
+    except Exception as exc:  # noqa: BLE001 — log and retry per-tensor
+        if convert_kwargs.get("quant_type") == "per-channel":
+            logger.warning(
+                "onnx2tf per-channel INT8 failed (%s: %s); retrying with per-tensor.",
+                type(exc).__name__,
+                exc,
+            )
+            convert_kwargs["quant_type"] = "per-tensor"
+            onnx2tf.convert(**convert_kwargs)
+        else:
+            raise
 
     return _normalize_tflite_outputs(onnx2tf_out, output_dir, modes_set)
 

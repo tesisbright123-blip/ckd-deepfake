@@ -130,7 +130,12 @@ training:
     method: replay
     ewc:
       lambda: 5000
-      fisher_samples: 1000
+      # Bumped 1000 -> 5000 to match Bhat et al. 2024 (EVCL, arXiv:2406.15972)
+      # and because Fisher diagonal estimation needs more samples for deep
+      # networks (MobileNetV3-Large = ~5.4M params) than for the shallow MLPs
+      # in the original EWC paper (Kirkpatrick 2017). Our gen-N val set is
+      # ~7500 samples so 5000 fits comfortably.
+      fisher_samples: 5000
     lwf:
       temperature: 2.0
     replay:

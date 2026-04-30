@@ -41,18 +41,22 @@ class LwFStrategy(AntiForgettingStrategy):
     """LwF with a frozen snapshot of the previous student.
 
     Args:
-        temperature: Softmax temperature used by the continual loss for the
-            retention KD term. Stored here for logging / bookkeeping — the
-            actual KL divergence is computed in
-            :class:`~src.training.losses.ContinualDistillationLoss`.
+        temperature: Softmax temperature used by the retention KD term in
+            :class:`~src.training.losses.ContinualDistillationLoss`. Default
+            ``2.0`` follows Li & Hoiem 2017. The trainer reads this via the
+            :attr:`retention_temperature` class slot and forwards it to the
+            loss as its ``retention_temperature`` argument, so the LwF KD
+            uses τ=2 even when the main teacher KD uses τ=4.
     """
 
     name = "lwf"
+    provides_retention_logits = True
 
     def __init__(self, temperature: float = 2.0) -> None:
         if temperature <= 0:
             raise ValueError(f"temperature must be > 0, got {temperature}")
         self.temperature = float(temperature)
+        self.retention_temperature = float(temperature)
         self._frozen_model: nn.Module | None = None
 
     # ------------------------------------------------------------------ #

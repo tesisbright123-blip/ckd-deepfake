@@ -430,7 +430,9 @@ def _run(args: argparse.Namespace) -> int:
     for gen in seen:
         peak = _peak_auc_from_previous_runs(results_dir, gen)
         auc_peak[gen] = peak if peak is not None else auc_after[gen]
-    cgrs_block = summarize_cgrs(auc_after, auc_peak)
+    cgrs_block = summarize_cgrs(
+        auc_after, auc_peak, current_generation=args.generation
+    )
 
     extra: dict[str, Any] = {
         "method": args.method,
@@ -438,6 +440,8 @@ def _run(args: argparse.Namespace) -> int:
         "previous_checkpoint": str(prev_ckpt_path),
         "checkpoint_path": str(checkpoint_dir / "best.pth"),
         "best_val_auc": float(trainer.best_val_auc),
+        "elapsed_seconds": float(getattr(trainer, "elapsed_seconds", 0.0)),
+        "gpu_hours": float(getattr(trainer, "gpu_hours", 0.0)),
         "auc_after": auc_after,
         "auc_peak": auc_peak,
         **cgrs_block,
@@ -454,9 +458,11 @@ def _run(args: argparse.Namespace) -> int:
         extra=extra,
     )
     logger.info(
-        "Wrote cross-gen metrics: %s (CGRS=%.4f)",
+        "Wrote cross-gen metrics: %s (CGRS=%.4f, AvgF_prev=%.4f, gpu_hours=%.3f)",
         metrics_path,
         cgrs_block["cgrs"],
+        cgrs_block["avg_forgetting_prev"],
+        float(getattr(trainer, "gpu_hours", 0.0)),
     )
     return 0
 

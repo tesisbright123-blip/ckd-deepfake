@@ -52,9 +52,27 @@ class AntiForgettingStrategy(ABC):
       :meth:`previous_logits` (produce target distributions for KD).
     * Replay overrides :meth:`before_training` (build exemplar buffer) and
       :meth:`augment_dataloader` (return a mixed loader at fit time).
+
+    Class attributes
+    ----------------
+    name : str
+        Short identifier used in logs and checkpoint paths.
+    provides_retention_logits : bool
+        Whether this strategy will return non-``None`` from
+        :meth:`previous_logits` on every batch. Used by
+        :class:`~src.training.continual_trainer.ContinualTrainer` to decide
+        whether ``ContinualDistillationLoss`` should renormalise alpha/gamma
+        (see ``has_retention`` flag on that class). LwF sets this to True;
+        EWC and plain Replay leave it False so the loss collapses cleanly to
+        the alpha*KD + gamma*CE form with renormalised weights.
+    retention_temperature : float | None
+        Temperature for the LwF-style KD on previous-student logits, when
+        applicable. ``None`` means "use the trainer's main temperature".
     """
 
     name: str = "base"
+    provides_retention_logits: bool = False
+    retention_temperature: float | None = None
 
     def before_training(
         self,

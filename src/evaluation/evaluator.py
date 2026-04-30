@@ -41,7 +41,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.evaluation.metrics import BinaryMetrics, compute_binary_metrics, compute_cgrs
+from src.evaluation.metrics import (
+    BinaryMetrics,
+    compute_average_forgetting,
+    compute_binary_metrics,
+    compute_cgrs,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -130,8 +135,20 @@ def summarize_cgrs(
     auc_peak: dict[str, float],
     *,
     generations: Iterable[str] | None = None,
+    current_generation: str | None = None,
 ) -> dict[str, float]:
-    """Shrink ``(auc_after, auc_peak)`` dicts into a CGRS summary block.
+    """Shrink ``(auc_after, auc_peak)`` dicts into a CGRS / forgetting summary.
+
+    Reports both:
+
+    * ``cgrs`` — our novel ratio metric averaged over all generations in
+      ``generations`` (or all of ``auc_after`` if unspecified).
+    * ``avg_forgetting_all`` — Chaudhry et al. 2018 mean ``peak − after`` over
+      the same set of generations. Compatible with the broader continual
+      learning literature.
+    * ``avg_forgetting_prev`` — same metric but excluding the generation that
+      was *just* trained (passed via ``current_generation``). This is the
+      stricter "did we forget the past" reading.
 
     ``generations`` restricts the computation to a subset; if ``None`` every
     key of ``auc_after`` is used.
@@ -141,6 +158,10 @@ def summarize_cgrs(
         auc_peak = {g: auc_peak[g] for g in generations if g in auc_peak}
     return {
         "cgrs": compute_cgrs(auc_after, auc_peak),
+        "avg_forgetting_all": compute_average_forgetting(auc_after, auc_peak),
+        "avg_forgetting_prev": compute_average_forgetting(
+            auc_after, auc_peak, exclude_current=current_generation
+        ),
         "num_generations": len(auc_after),
     }
 
