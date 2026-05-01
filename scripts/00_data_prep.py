@@ -420,10 +420,58 @@ def extract_zip_to_folder(zp: Path, target: Path) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _cleanup_partial_downloads(base: Path) -> int:
+    """Remove gdown / browser partial-download leftovers.
+
+    These appear when a download is interrupted (``*.part``,
+    ``*.crdownload``, ``*.tmp``). They are not valid ZIPs and only
+    consume Drive space.
+    """
+    if not base.is_dir():
+        return 0
+    junk_patterns = ("*.part", "*.crdownload", "*.tmp")
+    removed = 0
+    for pattern in junk_patterns:
+        for p in base.glob(pattern):
+            try:
+                size_mb = p.stat().st_size / 1e6
+                p.unlink()
+                print(f"[cleanup] removed junk file: {p.name} ({size_mb:.1f}MB)")
+                removed += 1
+            except OSError as exc:
+                print(f"[cleanup] failed to remove {p.name}: {exc}")
+    return removed
+
+
+def _find_real_zip(label: str) -> Path | None:
+    """Locate a real ZIP, checking Drive ``df40_real/`` first then ``/content/``.
+
+    Drive location is preferred (persistent across runtime restarts).
+    """
+    candidates = [
+        df40_real_root() / f"{label}.zip",
+        Path(f"/content/{label}.zip"),
+    ]
+    for c in candidates:
+        if c.is_file() and c.stat().st_size > 1_000_000:
+            return c
+    return None
+
+
 def run_extract() -> None:
-    """Extract every ZIP under df40/ + the two real ZIPs at /content/."""
+    """Extract every ZIP under df40/ + the two real ZIPs.
+
+    Sweeps partial-download junk first so leftovers from interrupted
+    gdown/browser downloads don't pile up on Drive.
+    """
     base = df40_root()
     base.mkdir(parents=True, exist_ok=True)
+
+    # 1) Sweep partial-download junk (e.g. fsgan.zip<rand>.part).
+    n_junk = _cleanup_partial_downloads(base)
+    n_junk += _cleanup_partial_downloads(df40_real_root())
+    if n_junk:
+        print(f"[cleanup] removed {n_junk} junk file(s) total\n")
 
     zips = sorted(base.glob("*.zip"))
     print("=" * 64)
@@ -446,24 +494,26 @@ def run_extract() -> None:
         ok, msg = extract_zip_to_folder(zp, target)
         print("done" if ok else f"FAIL: {msg}")
 
-    # Real ZIPs at /content/
+    # Real ZIPs — look in Drive (df40_real/) and /content/, prefer Drive.
     print("\n" + "=" * 64)
     print("Extracting real ZIPs (FF++, Celeb-DF)")
     print("=" * 64)
     for label in ["ff_real", "cdf_real"]:
-        zp = Path(f"/content/{label}.zip")
         target = df40_real_root() / label
-        if not zp.is_file():
-            if not target.is_dir() or not (target / EXTRACTED_MARKER).is_file():
-                print(f"[skip   ] {label}: no ZIP and not extracted (need to download first)")
-            else:
-                print(f"[skip   ] {label}: already extracted")
-            continue
         if (target / EXTRACTED_MARKER).is_file():
-            print(f"[skip   ] {label}: already extracted, deleting stray ZIP")
-            zp.unlink()
+            # Already extracted — clean up any stray ZIP source.
+            for stray in [df40_real_root() / f"{label}.zip", Path(f"/content/{label}.zip")]:
+                if stray.is_file():
+                    print(f"[skip   ] {label}: already extracted, deleting stray {stray}")
+                    stray.unlink()
+            print(f"[skip   ] {label}: already extracted")
             continue
-        print(f"[extract] {label}.zip ({zp.stat().st_size/1e9:.1f}GB) ... ", end="", flush=True)
+
+        zp = _find_real_zip(label)
+        if zp is None:
+            print(f"[skip   ] {label}: no ZIP found at df40_real/ or /content/ (need to download first)")
+            continue
+        print(f"[extract] {zp} ({zp.stat().st_size/1e9:.1f}GB) ... ", end="", flush=True)
         ok, msg = extract_zip_to_folder(zp, target)
         print("done" if ok else f"FAIL: {msg}")
 
