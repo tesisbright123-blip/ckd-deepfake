@@ -34,7 +34,9 @@ from src.utils.logger import get_logger  # noqa: E402
 
 
 def _build_split_config(
-    generation_cfg: dict, seed: int
+    generation_cfg: dict,
+    seed: int,
+    frames_per_video: int | None,
 ) -> SplitConfig:
     """Translate the YAML ``split_ratio`` list into a :class:`SplitConfig`."""
     ratios = generation_cfg.get("split_ratio", [0.70, 0.15, 0.15])
@@ -43,7 +45,13 @@ def _build_split_config(
             f"split_ratio must have exactly 3 values (train, val, test); got {ratios!r}"
         )
     train, val, test = (float(r) for r in ratios)
-    return SplitConfig(train=train, val=val, test=test, seed=seed)
+    return SplitConfig(
+        train=train,
+        val=val,
+        test=test,
+        seed=seed,
+        frames_per_video=frames_per_video,
+    )
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -75,14 +83,20 @@ def _run(args: argparse.Namespace) -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    split_cfg = _build_split_config(generation_cfg, seed=args.seed)
+    split_cfg = _build_split_config(
+        generation_cfg,
+        seed=args.seed,
+        frames_per_video=args.frames_per_video,
+    )
     logger.info(
-        "Generating splits for %s (train=%.3f val=%.3f test=%.3f seed=%d)",
+        "Generating splits for %s (train=%.3f val=%.3f test=%.3f "
+        "seed=%d frames_per_video=%s)",
         args.generation,
         split_cfg.train,
         split_cfg.val,
         split_cfg.test,
         split_cfg.seed,
+        split_cfg.frames_per_video,
     )
 
     results = generate_splits(
@@ -136,7 +150,20 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Override split output dir. Default: {drive}/datasets/splits",
     )
-    return p.parse_args()
+    p.add_argument(
+        "--frames-per-video",
+        type=int,
+        default=32,
+        help=(
+            "Cap frames retained per video. Default 32 (DeepfakeBench / DFDC "
+            "convention; reduces compute 3-5x with negligible AUC loss). "
+            "Pass 0 to keep every frame (legacy)."
+        ),
+    )
+    args = p.parse_args()
+    if args.frames_per_video == 0:
+        args.frames_per_video = None
+    return args
 
 
 if __name__ == "__main__":
