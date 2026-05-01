@@ -240,22 +240,64 @@ def run_download() -> None:
     Uses ``gdown --folder ... --remaining-ok`` so that quota errors on
     individual files do not abort the whole batch. Real ZIPs are tried
     individually with try/except.
+
+    IMPORTANT — placeholder hack
+    -----------------------------
+    ``gdown --folder`` decides whether to download each file by checking if
+    the ZIP exists at the destination *path*. Once we've extracted a ZIP and
+    deleted the source archive, gdown sees ``blendface.zip`` missing and
+    re-downloads it (wasting ~2GB, time, and a hit on the file's daily
+    quota). To prevent that we create **empty placeholder ZIPs** for every
+    technique that already has an ``.extracted_ok`` marker. gdown sees the
+    placeholders, skips them, and we delete the placeholders afterwards
+    (they're 0 bytes so easy to detect).
     """
     base = df40_root()
     base.mkdir(parents=True, exist_ok=True)
 
+    # 1) Create placeholder ZIPs for already-extracted techniques.
+    placeholders: list[Path] = []
+    if base.is_dir():
+        for folder in sorted(base.iterdir()):
+            if not folder.is_dir():
+                continue
+            if not (folder / EXTRACTED_MARKER).is_file():
+                continue
+            placeholder = base / f"{folder.name}.zip"
+            if not placeholder.exists():
+                placeholder.touch()
+                placeholders.append(placeholder)
+    if placeholders:
+        print(f"[gdown-prep] created {len(placeholders)} placeholder ZIPs to "
+              f"prevent gdown from re-downloading already-extracted techniques:")
+        for p in placeholders:
+            print(f"             {p.name}")
+
     print("=" * 64)
     print("Phase 1/2: Downloading DF40_train folder (resume mode)")
     print("Quota errors per-file will be logged and skipped, not fatal.")
+    print("Already-extracted techniques are protected by placeholder ZIPs.")
     print("=" * 64)
 
-    # gdown --folder skips files that already exist at destination by name.
-    subprocess.run(
-        ["gdown", "--folder",
-         f"https://drive.google.com/drive/folders/{DF40_TRAIN_FOLDER_ID}",
-         "-O", str(base), "--remaining-ok"],
-        check=False,
-    )
+    try:
+        # gdown --folder skips files that already exist at destination by name.
+        subprocess.run(
+            ["gdown", "--folder",
+             f"https://drive.google.com/drive/folders/{DF40_TRAIN_FOLDER_ID}",
+             "-O", str(base), "--remaining-ok"],
+            check=False,
+        )
+    finally:
+        # 2) Clean up placeholders that gdown left untouched (still 0 bytes).
+        # If a placeholder grew (gdown overwrote it), keep it — it's a real
+        # download we want to extract.
+        cleaned = 0
+        for p in placeholders:
+            if p.is_file() and p.stat().st_size == 0:
+                p.unlink()
+                cleaned += 1
+        if cleaned:
+            print(f"[gdown-prep] cleaned up {cleaned} unused placeholder ZIPs")
 
     print("\n" + "=" * 64)
     print("Phase 2/2: Real ZIPs (FF++ + Celeb-DF)")
