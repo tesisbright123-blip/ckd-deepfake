@@ -75,6 +75,51 @@ ALL_NEEDED = sorted(
     key=str.lower,
 )
 
+# Hardcoded file IDs for everything DF40_train ships, harvested from a
+# previous gdown --folder listing. Using individual ``gdown <id>`` calls
+# instead of ``--folder`` lets us hit only the techniques we actually need
+# (and skip already-extracted ones), avoiding wasted bandwidth and quota
+# burn on files we don't care about.
+#
+# Keys are normalised to lower-case so case-insensitive lookups work.
+# 4 needed techniques are NOT in DF40_train (heygen, MidJourney,
+# CollabDiff, whichfaceisreal) — they're shipped under DF40_test or are
+# part of "unknown methods" that need separate handling. Any technique
+# missing from this map will be reported as such by run_download().
+DF40_TRAIN_FILE_IDS: dict[str, str] = {
+    "blendface":     "1ZMnr65J7DlqE_BIG4vzDzNfpNjTo6Gow",
+    "danet":         "1zPkHt1taq3eh87kpt7tUAygxN7NJoTwt",
+    "ddim":          "1Ex0-7nZFC_MsOC30uQEfG5Ey2e6jwwK3",
+    "dit":           "1cDaupU8HhUtyc_UXPZf1UZac-NGPcV5K",
+    "e4s":           "15HBLeQOp5d3ptfYrJ5L9lfKpecU-yLbQ",
+    "facedancer":    "11pHHVF9VJIG4JzXU1V8iTV9bYkXJXPc8",
+    "faceswap":      "122-fpveOf2oUDwGzbhkgoVg2BrV_YVGC",
+    "facevid2vid":   "1mZR4CGZj4ktqL4U3jv4By9Vu1omh8NcH",
+    "fomm":          "1UgGDvGGw5H6Wf0KTHzjKoigHB5ALcC5Q",
+    "fsgan":         "1eSfRwulFw8VTlkwP8pb0cjtBlGaO0HRp",
+    "hyperreenact":  "1hyd9Clz1qQoNMheXr5tmEPzI4wrJAUkx",
+    "inswap":        "1hEsN-oY9Ye2OiAzGn03UD7AajztZ6b_B",
+    "lia":           "1JAbHz1O7UT0LjlXwJN9wLjebJxxTZvbc",
+    "mcnet":         "1suTcpt-j8Z6UujsGzi_lVXTujCl0pNZ9",
+    "mobileswap":    "1rF9pmnfVqTrmypQnJ4IAvrkDCkcOEKoJ",
+    "mraa":          "1WrXKUb6IMa_UA72k8SeqLeU2ClxnYXLu",
+    "one_shot_free": "1Ee0M3G7TUJkucCnur4-nqnIWkN3wBg2x",
+    "pirender":      "1x1fBFXx1TEVlguY_hME0QQuZgAqmhlvy",
+    "pixart":        "1LY6XzMhh5sxRGwcyLIKgn8G1KrNuSbe8",
+    "rddm":          "1VygeiCcCcj2wSvdyEDnIdeqDIEBk0NcQ",  # not in NEEDED
+    "sadtalker":     "1DQCVDlFInuAH3ryQgZIyKQzPiEIyFaaa",
+    "sd2.1":         "1rRbjGij6Zznkj5PV7vAL1c3r_pWIGQa6",
+    "simswap":       "1vnEXjxgSxmiNY-RkLQdsbhayTvAAoOIc",
+    "sit":           "1bViVK7sYOvP7m46T5ZcXvdQqfF6-X-pn",
+    "stylegan2":     "12LQnIp9gTtem9Wo4GMr6Q7MNVgxfp5Rg",
+    "stylegan3":     "1D_1Rp2-K-IoxvleuahmBSNTd2BmdLPUM",
+    "styleganxl":    "1UKDPdXd_p1iF_qux6RSyk9GWecy8WMoD",
+    "tpsm":          "1ickzY8cMp-wfyJy-FmM_aYdN-6ZokJe4",
+    "uniface":       "1I2vbldlCo2tvpCGe71JKIwYcqqpRWUCg",
+    "vqgan":         "1UBYXZm1ZgS6_lywxONQ-hNq-g41qbhYU",
+    "wav2lip":       "12X6MJ9--rCuptabYPXZ74ux-haV2h7cc",
+}
+
 
 # --------------------------------------------------------------------------- #
 #  Path helpers
@@ -234,70 +279,76 @@ def status_report() -> dict:
 # --------------------------------------------------------------------------- #
 #  Download
 # --------------------------------------------------------------------------- #
+def _resolve_file_id(technique: str) -> str | None:
+    """Case-insensitive lookup in DF40_TRAIN_FILE_IDS."""
+    return DF40_TRAIN_FILE_IDS.get(technique.lower())
+
+
+def _download_one_zip(file_id: str, dest: Path, label: str) -> bool:
+    """Download a single gdrive file via ``gdown <id> -O <dest>``.
+
+    Returns True on success, False on quota / network error. On error the
+    (possibly partial) destination file is removed so the next run starts
+    clean.
+    """
+    print(f"[try  ] {label} ... ", end="", flush=True)
+    try:
+        subprocess.run(["gdown", file_id, "-O", str(dest)], check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"FAIL ({exc.returncode})")
+        # Wipe partial / empty file so retry starts clean
+        if dest.is_file() and dest.stat().st_size < 100_000:
+            dest.unlink()
+        return False
+    if not dest.is_file() or dest.stat().st_size < 100_000:
+        print("FAIL (empty result)")
+        if dest.is_file():
+            dest.unlink()
+        return False
+    print(f"done ({dest.stat().st_size/1e9:.2f}GB)")
+    return True
+
+
 def run_download() -> None:
-    """Resume download of DF40_train folder + real ZIPs.
+    """Download only the techniques we need that aren't already on disk.
 
-    Uses ``gdown --folder ... --remaining-ok`` so that quota errors on
-    individual files do not abort the whole batch. Real ZIPs are tried
-    individually with try/except.
-
-    IMPORTANT — placeholder hack
-    -----------------------------
-    ``gdown --folder`` decides whether to download each file by checking if
-    the ZIP exists at the destination *path*. Once we've extracted a ZIP and
-    deleted the source archive, gdown sees ``blendface.zip`` missing and
-    re-downloads it (wasting ~2GB, time, and a hit on the file's daily
-    quota). To prevent that we create **empty placeholder ZIPs** for every
-    technique that already has an ``.extracted_ok`` marker. gdown sees the
-    placeholders, skips them, and we delete the placeholders afterwards
-    (they're 0 bytes so easy to detect).
+    Uses individual ``gdown <id>`` calls per file (NOT ``--folder``) so we
+    never burn bandwidth or per-file gdrive quota on techniques we already
+    extracted or don't need. Quota errors on one file are logged and the
+    batch continues.
     """
     base = df40_root()
     base.mkdir(parents=True, exist_ok=True)
 
-    # 1) Create placeholder ZIPs for already-extracted techniques.
-    placeholders: list[Path] = []
-    if base.is_dir():
-        for folder in sorted(base.iterdir()):
-            if not folder.is_dir():
-                continue
-            if not (folder / EXTRACTED_MARKER).is_file():
-                continue
-            placeholder = base / f"{folder.name}.zip"
-            if not placeholder.exists():
-                placeholder.touch()
-                placeholders.append(placeholder)
-    if placeholders:
-        print(f"[gdown-prep] created {len(placeholders)} placeholder ZIPs to "
-              f"prevent gdown from re-downloading already-extracted techniques:")
-        for p in placeholders:
-            print(f"             {p.name}")
+    # Build the work list: anything in NEEDED whose folder isn't marked
+    # extracted and whose ZIP isn't already downloaded.
+    to_download: list[tuple[str, str]] = []  # (technique, file_id)
+    no_id_in_train: list[str] = []
+    for tech in ALL_NEEDED:
+        existing_dir = find_existing_dir(base, tech)
+        if existing_dir is not None and (existing_dir / EXTRACTED_MARKER).is_file():
+            continue
+        if find_existing_zip(base, tech):
+            continue
+        fid = _resolve_file_id(tech)
+        if fid is None:
+            no_id_in_train.append(tech)
+            continue
+        to_download.append((tech, fid))
 
     print("=" * 64)
-    print("Phase 1/2: Downloading DF40_train folder (resume mode)")
-    print("Quota errors per-file will be logged and skipped, not fatal.")
-    print("Already-extracted techniques are protected by placeholder ZIPs.")
+    print("Phase 1/2: DF40 fake ZIPs (per-file individual download)")
     print("=" * 64)
-
-    try:
-        # gdown --folder skips files that already exist at destination by name.
-        subprocess.run(
-            ["gdown", "--folder",
-             f"https://drive.google.com/drive/folders/{DF40_TRAIN_FOLDER_ID}",
-             "-O", str(base), "--remaining-ok"],
-            check=False,
-        )
-    finally:
-        # 2) Clean up placeholders that gdown left untouched (still 0 bytes).
-        # If a placeholder grew (gdown overwrote it), keep it — it's a real
-        # download we want to extract.
-        cleaned = 0
-        for p in placeholders:
-            if p.is_file() and p.stat().st_size == 0:
-                p.unlink()
-                cleaned += 1
-        if cleaned:
-            print(f"[gdown-prep] cleaned up {cleaned} unused placeholder ZIPs")
+    print(f"  needed but missing: {len(to_download)}")
+    print(f"  needed but not in DF40_train listing: {no_id_in_train}")
+    if not to_download:
+        print("  -> nothing to do for fakes.")
+    else:
+        for tech, fid in to_download:
+            zp = base / f"{tech}.zip"
+            ok = _download_one_zip(fid, zp, f"{tech}.zip")
+            if not ok:
+                print(f"        -> retry later, or use 'Add Shortcut to My Drive' workaround")
 
     print("\n" + "=" * 64)
     print("Phase 2/2: Real ZIPs (FF++ + Celeb-DF)")
@@ -318,14 +369,8 @@ def run_download() -> None:
         if zp.is_file() and zp.stat().st_size > 1_000_000:
             print(f"[skip ] {label}.zip already downloaded ({zp.stat().st_size/1e9:.1f}GB)")
             continue
-        print(f"[try  ] {label}.zip ...")
-        try:
-            subprocess.run(
-                ["gdown", "--id", fid, "-O", str(zp)], check=True,
-            )
-            print(f"[done ] {label}.zip downloaded")
-        except subprocess.CalledProcessError as exc:
-            print(f"[FAIL ] {label}: {exc}")
+        ok = _download_one_zip(fid, zp, f"{label}.zip")
+        if not ok:
             print(f"        -> retry later, or use 'Add Shortcut to My Drive' workaround")
 
 
