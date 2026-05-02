@@ -14,8 +14,11 @@ build/
 *.pt
 *.tflite
 *.onnx
-data/
-outputs/
+# Leading slash = match ONLY at repo root. Without it, "data/" would
+# silently swallow src/data/ (the actual Python package containing
+# dataset.py / dataloader.py / splits.py) and leave it out of every clone.
+/data/
+/outputs/
 
 # Notebooks
 .ipynb_checkpoints/
