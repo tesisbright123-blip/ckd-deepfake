@@ -108,23 +108,24 @@ class EfficientNetB4Teacher(BaseTeacher):
             for k, v in raw_state.items()
         }
 
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # DeepfakeBench's detector class names the classifier head
+        # ``last_layer`` (a separate ``nn.Linear(1792, 2)`` outside their
+        # ``self.efficientnet`` submodule). The lukemelas EffNet calls the
+        # equivalent layer ``_fc``. Without remapping the classifier stays
+        # random-init -> garbage P(fake) predictions despite a valid backbone.
+        head_remap = {
+            "last_layer.weight": "_fc.weight",
+            "last_layer.bias":   "_fc.bias",
+            # Also handle the rare case where the ckpt stores a ``head.*``
+            # naming (some DFB forks).
+            "head.weight":       "_fc.weight",
+            "head.bias":         "_fc.bias",
+        }
+        for src_key, dst_key in head_remap.items():
+            if src_key in state_dict and dst_key not in state_dict:
+                state_dict[dst_key] = state_dict.pop(src_key)
 
-        # Final classifier head may have different name in the checkpoint
-        # (DeepfakeBench sometimes adds their own ``head`` layer separately).
-        # Attempt to map ``head.*`` keys to ``_fc.*`` if the latter is missing.
-        if any(k.startswith("head.") for k in state_dict) and any(
-            k.startswith("_fc.") for k in missing
-        ):
-            head_dict = {
-                "_fc." + k[len("head."):]: v
-                for k, v in state_dict.items()
-                if k.startswith("head.")
-            }
-            try:
-                model.load_state_dict(head_dict, strict=False)
-            except (RuntimeError, KeyError):
-                pass
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
         if missing:
             logger.warning(
