@@ -5,12 +5,30 @@ into the :class:`BaseTeacher` interface so ``scripts/03_generate_soft_labels.py`
 and ``src/models/teachers/ensemble.py`` can use it interchangeably with
 other teachers.
 
+Architecture compatibility (IMPORTANT)
+--------------------------------------
+DeepfakeBench's ``effnb4_best.pth`` was trained with the
+``efficientnet_pytorch`` library (lukemelas/EfficientNet-PyTorch), **not**
+``timm``. The two libraries have:
+
+* Different parameter names: lukemelas uses ``_conv_stem``, ``_bn0``,
+  ``_blocks.N._depthwise_conv``, ``_fc`` (with leading underscores and
+  ``_bn0``/``_bn1``/``_fc`` instead of ``bn1``/``bn2``/``classifier``);
+  timm uses ``conv_stem``, ``bn1``, ``blocks.N.X``, ``classifier``.
+* Different block internal structure (slightly different MBConvBlock
+  implementations).
+
+Loading a DeepfakeBench checkpoint into a timm model produces ~600 missing
+and ~700 unexpected keys, leaving the backbone effectively random-init.
+We therefore use ``efficientnet_pytorch`` here to match the checkpoint
+exactly.
+
 Called by:
     src/models/teachers/ensemble.py
     scripts/03_generate_soft_labels.py
 Reads:
     EfficientNet-B4 weight file (default: {drive}/checkpoints/teachers/efficientnet_b4.pth)
-Preprocessing: Albumentations LongestMaxSize -> PadIfNeeded(224) -> ImageNet Normalize -> ToTensor.
+Preprocessing: Albumentations Resize(224) -> ImageNet Normalize -> ToTensor.
 Output: per-image ``P(fake)`` as ``np.ndarray`` shape ``(B,)``, dtype ``float32``.
 """
 from __future__ import annotations
@@ -58,39 +76,83 @@ class EfficientNetB4Teacher(BaseTeacher):
     # ------------------------------------------------------------------ #
 
     def load(self, weight_path: str | Path) -> None:
-        """Build EfficientNet-B4 via ``timm`` and load DeepfakeBench weights."""
-        # Lazy import so unit tests that stub the teacher don't need timm.
-        import timm
+        """Build EfficientNet-B4 via ``efficientnet_pytorch`` (lukemelas) and
+        load DeepfakeBench weights.
 
-        model = timm.create_model(
-            "efficientnet_b4",
-            pretrained=False,
+        Loader strips the ``efficientnet.`` prefix that DeepfakeBench's
+        detector wrapper adds (their saved state dict looks like
+        ``{'efficientnet._conv_stem.weight': ..., ..., '_fc.weight': ...}``
+        because their detector class holds the model as ``self.efficientnet``).
+        After stripping we have keys matching the lukemelas model
+        directly: ``_conv_stem.weight``, ``_bn0.weight``, ..., ``_fc.weight``.
+        """
+        try:
+            from efficientnet_pytorch import EfficientNet
+        except ImportError as exc:
+            raise ModuleNotFoundError(
+                "efficientnet_pytorch is required for the DeepfakeBench-trained "
+                "EfficientNet-B4 teacher. Install with: pip install efficientnet-pytorch"
+            ) from exc
+
+        model = EfficientNet.from_name(
+            "efficientnet-b4",
             num_classes=self.num_classes,
         )
-        state_dict = safe_load_state_dict(weight_path)
+
+        # safe_load_state_dict already strips 'module.', 'backbone.', 'model.',
+        # 'net.' prefixes. We additionally strip 'efficientnet.' which is
+        # specific to DeepfakeBench's detector wrapper.
+        raw_state = safe_load_state_dict(weight_path)
+        state_dict = {
+            (k[len("efficientnet."):] if k.startswith("efficientnet.") else k): v
+            for k, v in raw_state.items()
+        }
+
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+        # Final classifier head may have different name in the checkpoint
+        # (DeepfakeBench sometimes adds their own ``head`` layer separately).
+        # Attempt to map ``head.*`` keys to ``_fc.*`` if the latter is missing.
+        if any(k.startswith("head.") for k in state_dict) and any(
+            k.startswith("_fc.") for k in missing
+        ):
+            head_dict = {
+                "_fc." + k[len("head."):]: v
+                for k, v in state_dict.items()
+                if k.startswith("head.")
+            }
+            try:
+                model.load_state_dict(head_dict, strict=False)
+            except (RuntimeError, KeyError):
+                pass
 
         if missing:
             logger.warning(
-                "%s: %d missing keys when loading %s (first 3: %s)",
+                "%s: %d missing keys when loading %s (first 5: %s)",
                 self.name,
                 len(missing),
                 weight_path,
-                missing[:3],
+                missing[:5],
             )
         if unexpected:
             logger.warning(
-                "%s: %d unexpected keys when loading %s (first 3: %s)",
+                "%s: %d unexpected keys when loading %s (first 5: %s)",
                 self.name,
                 len(unexpected),
                 weight_path,
-                unexpected[:3],
+                unexpected[:5],
             )
 
         model.eval()
         model.to(self.device)
         self.model = model
-        logger.info("%s: loaded weights from %s", self.name, weight_path)
+        logger.info(
+            "%s: loaded weights from %s (missing=%d, unexpected=%d)",
+            self.name,
+            weight_path,
+            len(missing),
+            len(unexpected),
+        )
 
     # ------------------------------------------------------------------ #
     #  Inference

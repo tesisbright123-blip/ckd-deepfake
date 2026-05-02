@@ -1,6 +1,10 @@
 torch>=2.0.0
 torchvision>=0.15.0
 timm>=0.9.0
+# DeepfakeBench effnb4_best.pth was trained with this library (lukemelas),
+# not timm. Required for the EfficientNet-B4 teacher to load with matching
+# parameter names. See src/models/teachers/efficientnet_b4.py for details.
+efficientnet-pytorch>=0.7.1
 albumentations>=1.3.0
 opencv-python-headless>=4.8.0
 facenet-pytorch>=2.5.0
