@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,15 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
+# Critical for DataLoader multi-process safety on Drive FUSE — without this,
+# cv2's internal OpenMP/pthreads conflict with forked workers and reads slow
+# 15x (verified by diagnostic micro-benchmark on 100 files: 151 fps with
+# workers=2 vs 9.6 fps with workers=8 unless cv2 threading is disabled).
+import cv2  # noqa: E402
+
+cv2.setNumThreads(0)
 
 # Make ``src`` importable when invoked as ``python scripts/03_generate_soft_labels.py``.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -146,8 +156,14 @@ def _run_teacher_inference(
     *,
     batch_size: int,
     num_workers: int,
+    desc: str = "inference",
 ) -> np.ndarray:
-    """Run ``teacher`` on every row of ``csv_path`` and return a (N,) float32 array."""
+    """Run ``teacher`` on every row of ``csv_path`` and return a (N,) float32 array.
+
+    Shows a tqdm progress bar with running fps so long inference runs are
+    observable. The bar updates at most every 2 seconds to keep the log
+    clean even when redirected.
+    """
     transform = teacher.get_preprocessing()
     dataset = _TeacherInferenceDataset(csv_path, transform)
 
@@ -158,15 +174,30 @@ def _run_teacher_inference(
         shuffle=False,
         drop_last=False,
         pin_memory=torch.cuda.is_available(),
+        # Workers stay alive across batches — saves the per-batch fork cost
+        # on Drive-mounted datasets where worker startup is non-trivial.
+        persistent_workers=num_workers > 0,
     )
 
     out = np.empty(len(dataset), dtype=np.float32)
     cursor = 0
-    for batch in loader:
+    start = time.time()
+    pbar = tqdm(
+        loader,
+        total=len(loader),
+        desc=desc,
+        mininterval=2.0,  # update at most every 2 seconds
+        dynamic_ncols=True,
+    )
+    for batch in pbar:
         probs = teacher.predict_proba(batch)
         n = int(probs.shape[0])
         out[cursor : cursor + n] = probs
         cursor += n
+        elapsed = time.time() - start
+        if elapsed > 0:
+            pbar.set_postfix(fps=f"{cursor/elapsed:.1f}", samples=cursor)
+    pbar.close()
     if cursor != len(dataset):
         raise RuntimeError(
             f"Inference collected {cursor} samples but dataset has {len(dataset)}"
@@ -255,6 +286,31 @@ def _run(args: argparse.Namespace) -> int:
         try:
             per_split: dict[str, np.ndarray] = {}
             for split, csv_path in split_csvs.items():
+                out_path = output_dir / split / f"{teacher_name}.npy"
+
+                # Resume support: skip if already saved (verify shape matches CSV).
+                if out_path.is_file() and not args.force:
+                    expected_n = len(pd.read_csv(csv_path, usecols=["face_path"]))
+                    cached = np.load(out_path)
+                    if cached.shape == (expected_n,):
+                        logger.info(
+                            "Resume: %s/%s already done (N=%d, mean=%.4f) — skipping. Pass --force to recompute.",
+                            teacher_name,
+                            split,
+                            cached.shape[0],
+                            float(cached.mean()),
+                        )
+                        per_split[split] = cached.astype(np.float32, copy=False)
+                        continue
+                    else:
+                        logger.warning(
+                            "Resume: %s/%s shape mismatch (%s vs expected (%d,)) — recomputing.",
+                            teacher_name,
+                            split,
+                            cached.shape,
+                            expected_n,
+                        )
+
                 logger.info(
                     "Teacher %s: inferring %s/%s (%s)",
                     teacher_name,
@@ -267,8 +323,8 @@ def _run(args: argparse.Namespace) -> int:
                     csv_path,
                     batch_size=args.batch_size,
                     num_workers=args.num_workers,
+                    desc=f"{teacher_name}/{args.generation}/{split}",
                 )
-                out_path = output_dir / split / f"{teacher_name}.npy"
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 np.save(out_path, probs)
                 logger.info(
@@ -400,6 +456,15 @@ def _parse_args() -> argparse.Namespace:
         "--output-dir",
         default=None,
         help="Override output dir. Default: {drive}/soft_labels/{generation}",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-run inference even if a cached .npy with matching shape already "
+            "exists. Default behavior is to resume by skipping completed "
+            "(teacher x split) cells."
+        ),
     )
     return p.parse_args()
 
