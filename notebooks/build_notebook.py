@@ -1,6 +1,18 @@
 """One-shot generator for notebooks/colab_run_all.ipynb.
 
 Run from repo root:   python notebooks/build_notebook.py
+
+The generated notebook reflects the post-Phase-0-4 pipeline:
+  - Drive-FUSE workaround via scripts/00_setup_local_mirror.py (~15 min)
+  - 3-teacher ensemble soft labels (effb4 + recce + clip), --num-workers 2
+  - Initial distillation gen1 with --num-seeds 3
+  - Continual gen2/gen3 with --method replay+ewc and --num-seeds 3
+  - Aggregate seeds (mean +/- std)
+  - Optional A6 ablation (5 anti-forgetting methods)
+  - Edge evaluation + figures
+
+Each long-running cell ends with an auto-disconnect block so you can
+sleep through the run without burning Pro+ compute units while idle.
 """
 from __future__ import annotations
 
@@ -28,34 +40,63 @@ def code(text: str) -> dict:
 
 CELLS: list[dict] = []
 
+# --------------------------------------------------------------------- #
+#  Title + overview
+# --------------------------------------------------------------------- #
 CELLS.append(md(
-    "# CKD-Deepfake — End-to-End Colab Pipeline\n"
+    "# CKD-Deepfake — End-to-End Colab Pipeline (v2)\n"
     "\n"
     "Thesis: **Continual Knowledge Distillation for Cross-Generational Deepfake Detection on Edge Devices**.\n"
     "\n"
-    "This notebook runs the full pipeline on Google Colab with a single A100/T4 GPU:\n"
+    "This notebook runs the **post-Phase-0-4** pipeline that codifies every "
+    "lesson from the prior runs:\n"
     "\n"
-    "1. Mount Drive + clone private repo\n"
-    "2. Download DF40 (fake crops) + DF40 real crops + teacher weights\n"
-    "3. Catalog DF40 into `metadata_<gen>.csv` (gen1 = classic face-swap, gen2 = reenactment, gen3 = diffusion/modern)\n"
-    "4. Generate splits + ensemble soft labels\n"
-    "5. Initial distillation on gen1, then continual distillation on gen2 → gen3\n"
-    "6. Edge evaluation (TFLite fp32/fp16/int8) + generate figures\n"
+    "| Stage | Cells | What it does |\n"
+    "|---|---|---|\n"
+    "| Setup | 1–4 | Mount Drive, clone repo, install deps, sanity-check A100 |\n"
+    "| FUSE workaround | 5 | `scripts/00_setup_local_mirror.py` — copy zips → local NVMe, extract, rewrite CSVs, generate `configs/local.yaml` |\n"
+    "| Soft labels | 6 | 3-teacher ensemble (EffB4 + RECCE + CLIP), local NVMe input, Drive output |\n"
+    "| Initial distillation | 7 | gen1 student, 3 seeds |\n"
+    "| Continual distillation | 8–9 | gen2 → gen3 with `--method replay+ewc`, 3 seeds, full retention metrics |\n"
+    "| Aggregate | 10 | `scripts/aggregate_seeds.py` — mean +/- std for thesis reporting |\n"
+    "| Edge eval | 11 | TFLite fp32/fp16/int8 + latency benchmark |\n"
+    "| Figures | 12 | thesis figures / tables |\n"
+    "| Optional ablations | 13 | A6 anti-forgetting method comparison (5 methods × 3 seeds) |\n"
     "\n"
-    "**Dataset choice.** All three generations come from the **DF40 dataset** — it bundles 40 techniques covering "
-    "classic face-swap → reenactment → modern diffusion. One dataset, consistent face-crop format (224×224), "
-    "no per-video face extraction required.\n"
+    "## Why this pipeline (read once before running)\n"
+    "\n"
+    "* **Drive FUSE bottleneck.** Reading 700K small face crops directly from Drive runs at ~2.5 fps "
+    "(each `cv2.imread` triggers an HTTP API call). The same code reads from local NVMe at ~368 fps — "
+    "a 147× speedup. Cell 5 codifies the working setup: copy zips (large file = fast) → extract locally → "
+    "rewrite split CSVs → symlink soft labels & teacher checkpoints → generate `configs/local.yaml`.\n"
+    "* **3-teacher ensemble.** EffB4 (DeepfakeBench), RECCE (DeepfakeBench, vendored timm Xception "
+    "approximation), CLIP ViT-L/14 (CLIPping-the-Deception, fixed checkpoint). Excess-AUC weighting "
+    "auto-down-weights any teacher whose val AUC drops below 0.55; the new weak-teacher gate aborts "
+    "the ensemble if 2+ teachers fail to load (catches checkpoint format mismatches early).\n"
+    "* **Replay+EWC default method.** Buffer 10% (up from 5%) for stronger Gen2 retention, plus EWC "
+    "Fisher penalty. Combined > either alone (per Fontana 2025 + Kirkpatrick 2017).\n"
+    "* **Multi-seed (3 seeds).** Reports mean +/- std rather than a single number — required for "
+    "thesis-grade credibility on a stochastic CL benchmark.\n"
+    "* **Auto-disconnect.** Long-running cells call `runtime.unassign()` after a 60-second grace "
+    "period, so a cell that finishes at 3am doesn't keep burning compute units until you wake up. "
+    "Interrupt the cell during the grace period to keep the runtime alive.\n"
 ))
 
-CELLS.append(md("## 0. Sanity check: GPU + Python"))
+# --------------------------------------------------------------------- #
+#  1. Sanity check: GPU + Python
+# --------------------------------------------------------------------- #
+CELLS.append(md("## 1. Sanity check: GPU + Python"))
 CELLS.append(code(
     "!nvidia-smi || echo 'No GPU — switch runtime to GPU before running.'\n"
     "import sys, platform\n"
-    "print('Python:', sys.version)\n"
+    "print('Python:', sys.version.split()[0])\n"
     "print('Platform:', platform.platform())\n"
 ))
 
-CELLS.append(md("## 1. Mount Google Drive"))
+# --------------------------------------------------------------------- #
+#  2. Mount Drive
+# --------------------------------------------------------------------- #
+CELLS.append(md("## 2. Mount Google Drive"))
 CELLS.append(code(
     "from google.colab import drive\n"
     "drive.mount('/content/drive')\n"
@@ -70,11 +111,14 @@ CELLS.append(code(
     "print('Drive root:', DRIVE_ROOT)\n"
 ))
 
+# --------------------------------------------------------------------- #
+#  3. Clone repo
+# --------------------------------------------------------------------- #
 CELLS.append(md(
-    "## 2. Clone the repository\n"
+    "## 3. Clone the repository\n"
     "\n"
-    "The repo is private. You'll need a [GitHub personal access token](https://github.com/settings/tokens) "
-    "with `repo` scope. It's only used to clone and is not stored.\n"
+    "The repo is private. Provide a [GitHub personal access token](https://github.com/settings/tokens) "
+    "with `repo` scope when prompted. Token is consumed once and not stored.\n"
 ))
 CELLS.append(code(
     "import getpass, os, subprocess\n"
@@ -94,228 +138,394 @@ CELLS.append(code(
     "\n"
     "os.chdir(REPO_DIR)\n"
     "print('Working dir:', os.getcwd())\n"
+    "subprocess.run(['git', 'log', '--oneline', '-1'])\n"
     "!ls\n"
 ))
 
-CELLS.append(md("## 3. Install dependencies"))
+# --------------------------------------------------------------------- #
+#  4. Install dependencies
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 4. Install dependencies\n"
+    "\n"
+    "`pip install -e .` registers the repo as an editable package so "
+    "`from src.X import Y` works from any working directory (avoids the "
+    "ModuleNotFoundError trap when running scripts from notebook subprocess).\n"
+))
 CELLS.append(code(
     "!pip install -q -r requirements.txt\n"
+    "!pip install -e . -q\n"
     "!pip install -q gdown tqdm\n"
 ))
 
+# --------------------------------------------------------------------- #
+#  5. Local mirror setup (FUSE workaround)
+# --------------------------------------------------------------------- #
 CELLS.append(md(
-    "## 4. Download + extract DF40 to Drive (one-time, ~55 GB compressed → ~70 GB extracted)\n"
+    "## 5. Set up local NVMe mirror (★ CRITICAL — bypasses Drive FUSE bottleneck)\n"
     "\n"
-    "All download + extract logic lives in `scripts/00_data_prep.py` so it survives:\n"
-    "- runtime disconnects (re-runs pick up exactly where they stopped, via `.extracted_ok` markers)\n"
-    "- gdrive quota errors (per-file failures are logged, batch continues)\n"
-    "- partial extracts (folder + leftover ZIP → auto-wipe + re-extract)\n"
-    "- laptop crashes (no in-cell state to lose; everything is a script + Drive)\n"
+    "**Why this step exists.** Reading 700K small face crops directly from "
+    "`/content/drive/MyDrive/...` runs at ~2.5 fps because each `cv2.imread` "
+    "triggers an HTTP API call. The same code reads from `/content/df40_local` "
+    "(Colab NVMe) at ~368 fps — **147× faster**.\n"
     "\n"
-    "Three actions:\n"
-    "- `--action status` — print what's done / partial / missing (no side effects)\n"
-    "- `--action download` — resume gdown of DF40_train folder + 2 real ZIPs\n"
-    "- `--action extract` — extract every ZIP that hasn't been marked extracted\n"
-    "- `--action all` — status → download → extract → status\n"
+    "**What it does.** Reads zip archives from "
+    "`{drive}/datasets/raw/df40_zip_backup/`, copies them locally (~9 min for 19 zips), "
+    "extracts (~4 min for 461K files), patches missing `uniface` frames from Drive "
+    "(small count, FUSE OK), rewrites split CSVs to local paths, symlinks soft labels "
+    "+ teacher checkpoints, and generates `configs/local.yaml`. Idempotent via `--resume`.\n"
     "\n"
-    "Re-run this cell as many times as needed. It's safe and idempotent.\n"
+    "**Pre-requisite.** The zip archives must already exist at "
+    "`{drive}/datasets/raw/df40_zip_backup/` from earlier sessions. If you're "
+    "starting from scratch, download DF40 zips first via the original `colab_setup.ipynb` "
+    "(legacy notebook).\n"
+    "\n"
+    "Disk usage: ~50-60 GB on local `/content` (Colab default 200+ GB free for A100).\n"
 ))
 CELLS.append(code(
-    "# Quick status check first (no side effects).\n"
-    "!python scripts/00_data_prep.py --action status\n"
-))
-CELLS.append(code(
-    "# Full pipeline: download anything missing, then extract everything.\n"
-    "# Pixart alone takes ~3-5h to extract on Drive (13.8GB ZIP).\n"
-    "# Total wall time ~3-6 h for a fresh run (less if resuming).\n"
-    "!python scripts/00_data_prep.py --action all\n"
-))
-
-CELLS.append(md(
-    "## 5. Download teacher checkpoints (auto)\n"
+    "!python scripts/00_setup_local_mirror.py --generations all --resume\n"
     "\n"
-    "Three teachers, all downloaded automatically and cached on Drive:\n"
-    "\n"
-    "| Model | Source | Size |\n"
-    "|---|---|---|\n"
-    "| EfficientNet-B4 | DeepfakeBench GitHub release | ~68 MB |\n"
-    "| Recce | DeepfakeBench GitHub release | ~183 MB |\n"
-    "| CLIP ViT-L/14 (CLIPping head) | Google Drive | ~1.7 GB |\n"
-    "\n"
-    "Cell is idempotent — skips files that already exist.\n"
-))
-CELLS.append(code(
-    "import os, subprocess\n"
-    "from pathlib import Path\n"
-    "\n"
-    "teachers_dir = Path('/content/drive/MyDrive/CKD_Thesis/checkpoints/teachers')\n"
-    "teachers_dir.mkdir(parents=True, exist_ok=True)\n"
-    "\n"
-    "DOWNLOADS = [\n"
-    "    {\n"
-    "        'name': 'efficientnet_b4.pth',\n"
-    "        'kind': 'wget',\n"
-    "        'url':  'https://github.com/SCLBD/DeepfakeBench/releases/download/v1.0.1/effnb4_best.pth',\n"
-    "    },\n"
-    "    {\n"
-    "        'name': 'recce.pth',\n"
-    "        'kind': 'wget',\n"
-    "        'url':  'https://github.com/SCLBD/DeepfakeBench/releases/download/v1.0.1/recce_best.pth',\n"
-    "    },\n"
-    "    {\n"
-    "        'name': 'clip_clipping.pth',\n"
-    "        'kind': 'gdown',\n"
-    "        'id':   '1jtkBoIuMw5wrooTv-anh668G3_Xt-UnX',\n"
-    "    },\n"
-    "]\n"
-    "\n"
-    "for item in DOWNLOADS:\n"
-    "    dst = teachers_dir / item['name']\n"
-    "    if dst.is_file() and dst.stat().st_size > 1_000_000:\n"
-    "        print(f\"[skip] {item['name']} already present ({dst.stat().st_size/1e6:.1f} MB)\")\n"
-    "        continue\n"
-    "    print(f\"[download] {item['name']} ...\")\n"
-    "    if item['kind'] == 'wget':\n"
-    "        subprocess.run(\n"
-    "            ['wget', '-q', '--show-progress', item['url'], '-O', str(dst)],\n"
-    "            check=True,\n"
-    "        )\n"
-    "    else:  # gdown\n"
-    "        import gdown\n"
-    "        gdown.download(id=item['id'], output=str(dst), quiet=False, fuzzy=True)\n"
-    "    print(f\"  saved -> {dst} ({dst.stat().st_size/1e6:.1f} MB)\")\n"
-    "\n"
-    "print('\\n=== Teacher weights ===')\n"
-    "for fname in ['efficientnet_b4.pth', 'recce.pth', 'clip_clipping.pth']:\n"
-    "    p = teachers_dir / fname\n"
-    "    status = f'OK  ({p.stat().st_size/1e6:.1f} MB)' if p.is_file() else 'MISSING'\n"
-    "    print(f'  {status:20s}  {fname}')\n"
-))
-
-CELLS.append(md(
-    "## 6. Catalog DF40 → `metadata_<gen>.csv`\n"
-    "\n"
-    "Technique lists per generation come from `configs/default.yaml`. The catalog script:\n"
-    "\n"
-    "- Walks every requested technique under `datasets/raw/df40/`, handles `ff/`, `cdf/`, `fake/` and "
-    "  flat layouts.\n"
-    "- Pulls real frames from `datasets/raw/df40_real/` and labels them 0.\n"
-    "- Writes the canonical 7-column metadata CSV consumed by step 02.\n"
-))
-CELLS.append(code(
-    "for gen in ['gen1', 'gen2', 'gen3']:\n"
-    "    print(f'=== Cataloging {gen} ===')\n"
-    "    !python scripts/01b_catalog_df40.py --config configs/default.yaml --generation $gen\n"
-    "\n"
+    "# Sanity check: a few sample paths must exist on local NVMe\n"
     "import pandas as pd\n"
+    "from pathlib import Path\n"
     "for gen in ['gen1', 'gen2', 'gen3']:\n"
-    "    p = f'/content/drive/MyDrive/CKD_Thesis/datasets/faces/metadata_{gen}.csv'\n"
-    "    df = pd.read_csv(p)\n"
-    "    print(f'{gen}: rows={len(df)} real={(df.label==0).sum()} fake={(df.label==1).sum()} '\n"
-    "          f'techniques={df.technique.nunique()}')\n"
+    "    csv = Path(f'/content/ckd_local/datasets/splits/{gen}_train.csv')\n"
+    "    if not csv.is_file():\n"
+    "        print(f'  [WARN] {csv} missing'); continue\n"
+    "    df = pd.read_csv(csv, usecols=['face_path']).head(20)\n"
+    "    n_ok = sum(1 for p in df['face_path'] if Path(p).is_file())\n"
+    "    print(f'  {gen}_train: {n_ok}/20 sampled files exist locally  '\n"
+    "          f'{\"OK\" if n_ok == 20 else \"FAIL — re-run setup, may need uniface patch\"}')\n"
 ))
 
-CELLS.append(md("## 7. Generate 70/15/15 video-level splits"))
+# --------------------------------------------------------------------- #
+#  6. Soft labels (3-teacher ensemble) — requires A100, ~3-5 hours
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 6. Generate ensemble soft labels (3 teachers, all 3 generations)\n"
+    "\n"
+    "**Hardware: A100 strongly recommended.** CLIP ViT-L/14 forward is the heaviest model.\n"
+    "Estimate: **~3–5 hours** total (gen1 ≈ 1h, gen2 ≈ 1.5h, gen3 ≈ 1h-ish, depends on disk).\n"
+    "\n"
+    "Reads:  local mirror (`configs/local.yaml`).  \n"
+    "Writes: per-teacher `.npy` + `ensemble.npy` + `ensemble_weights.json` directly to **Drive** "
+    "(`{drive}/soft_labels/{gen}/`) — symlinked into the local mirror so writes survive runtime restarts.\n"
+    "\n"
+    "**Watch points during run:**\n"
+    "* `efficientnet_b4: loaded weights from … (missing=0, unexpected=0)` — checkpoint format OK.\n"
+    "* `recce: loaded weights from … (missing=X, unexpected=Y)` — RECCE arch is the vendored "
+    "timm-legacy_xception approximation; some missing keys are expected. The `excess_auc` weighting "
+    "in the ensemble will auto-down-weight RECCE if its val AUC < 0.55.\n"
+    "* `GATE FAIL: 2/3 teachers have val AUC < 0.55` — ABORT signal. Checkpoint loading is broken; "
+    "investigate before re-running. Single weak teacher = OK (down-weighted).\n"
+    "\n"
+    "Auto-disconnect at end of run (60-second grace period — interrupt to keep runtime).\n"
+))
 CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
+    "import time\n"
+    "from google.colab import runtime as colab_runtime\n"
+    "\n"
+    "start = time.time()\n"
+    "print(f'=== Soft labels (3 teachers, all 3 gens) started at {time.strftime(\"%Y-%m-%d %H:%M:%S\")} ===')\n"
     "for gen in ['gen1', 'gen2', 'gen3']:\n"
-    "    !python scripts/02_generate_splits.py --config configs/default.yaml --generation $gen --seed 0\n"
+    "    !python -u scripts/03_generate_soft_labels.py \\\n"
+    "        --config configs/local.yaml \\\n"
+    "        --generation $gen \\\n"
+    "        --teachers efficientnet_b4,recce,clip_vit_l14 \\\n"
+    "        --num-workers 2 \\\n"
+    "        --force\n"
+    "elapsed_min = (time.time() - start) / 60\n"
+    "print(f'\\n=== ALL SOFT LABELS DONE in {elapsed_min:.1f} min ({elapsed_min/60:.2f} hours) ===')\n"
+    "print(f'Compute used: ~{elapsed_min/60 * 5.37:.1f} units')\n"
     "\n"
-    "!ls /content/drive/MyDrive/CKD_Thesis/datasets/splits/\n"
+    "# Sync soft labels to Drive (in case symlink path didn't catch all writes)\n"
+    "!rsync -av /content/ckd_local/soft_labels/ /content/drive/MyDrive/CKD_Thesis/soft_labels/ 2>&1 | tail -5\n"
+    "\n"
+    "print('\\nAuto-disconnect in 60 seconds (interrupt cell to keep runtime)...')\n"
+    "time.sleep(60)\n"
+    "colab_runtime.unassign()\n"
 ))
 
+# --------------------------------------------------------------------- #
+#  7. Initial distillation gen1, 3 seeds
+# --------------------------------------------------------------------- #
 CELLS.append(md(
-    "## 8. Generate ensemble soft labels (teacher predictions)\n"
+    "## 7. Initial distillation on gen1 (3 seeds — multi-seed reporting)\n"
     "\n"
-    "Runs all three teachers over train/val frames per generation and caches the softmax average. "
-    "Slowest step in the pipeline — budget ~1 h per generation on A100.\n"
+    "Trains MobileNetV3-Large student on gen1 via KD from the 3-teacher ensemble. \n"
+    "`--num-seeds 3` runs the training 3 times with seeds 0, 1, 2 and writes per-seed "
+    "checkpoints (`gen1_seed0/`, `gen1_seed1/`, `gen1_seed2/`) and metrics JSONs.\n"
+    "\n"
+    "Estimate: **~2 hours total** (≈40 min/seed at A100). Auto-disconnects after.\n"
 ))
 CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
+    "import time\n"
+    "from google.colab import runtime as colab_runtime\n"
+    "\n"
+    "start = time.time()\n"
+    "print(f'=== Initial distillation gen1 (3 seeds) started at {time.strftime(\"%Y-%m-%d %H:%M:%S\")} ===')\n"
+    "!python -u scripts/04_initial_distillation.py \\\n"
+    "    --config configs/local.yaml \\\n"
+    "    --generation gen1 \\\n"
+    "    --num-workers 2 \\\n"
+    "    --num-seeds 3\n"
+    "elapsed_min = (time.time() - start) / 60\n"
+    "print(f'\\n=== Initial distillation DONE in {elapsed_min:.1f} min ===')\n"
+    "\n"
+    "# Sync to Drive\n"
+    "!rsync -av /content/ckd_local/checkpoints/students/ /content/drive/MyDrive/CKD_Thesis/checkpoints/students/ 2>&1 | tail -5\n"
+    "!rsync -av /content/ckd_local/results/raw/ /content/drive/MyDrive/CKD_Thesis/results/raw/ 2>&1 | tail -5\n"
+    "\n"
+    "print('\\nAuto-disconnect in 60 seconds...')\n"
+    "time.sleep(60)\n"
+    "colab_runtime.unassign()\n"
+))
+
+# --------------------------------------------------------------------- #
+#  8. Continual gen2 with replay+ewc, 3 seeds
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 8. Continual distillation: gen1 → gen2 (`replay+ewc`, 3 seeds)\n"
+    "\n"
+    "Combines data-level protection (10% herding-selected exemplar buffer) with "
+    "weight-level protection (EWC Fisher penalty, λ=5000, fisher_samples=5000). "
+    "Loss renormalisation kicks in automatically: alpha+gamma=1 with beta=0 "
+    "(no LwF retention term).\n"
+    "\n"
+    "Uses `seed0` checkpoint as the previous-gen anchor for all 3 gen2 seeds — "
+    "this matches Fontana et al. (2025)'s convention and isolates gen2 training "
+    "stochasticity from gen1 stochasticity.\n"
+    "\n"
+    "Estimate: **~2.5 hours** (≈50 min/seed). Auto-disconnects after.\n"
+))
+CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
+    "import time\n"
+    "from google.colab import runtime as colab_runtime\n"
+    "\n"
+    "PREV = '/content/ckd_local/checkpoints/students/gen1_seed0/best.pth'\n"
+    "start = time.time()\n"
+    "print(f'=== Continual gen2 replay+ewc (3 seeds) started at {time.strftime(\"%Y-%m-%d %H:%M:%S\")} ===')\n"
+    "print(f'Previous checkpoint: {PREV}')\n"
+    "\n"
+    "!python -u scripts/05_continual_distillation.py \\\n"
+    "    --config configs/local.yaml \\\n"
+    "    --generation gen2 \\\n"
+    "    --method replay+ewc \\\n"
+    "    --previous-checkpoint $PREV \\\n"
+    "    --num-workers 2 \\\n"
+    "    --num-seeds 3\n"
+    "elapsed_min = (time.time() - start) / 60\n"
+    "print(f'\\n=== Continual gen2 DONE in {elapsed_min:.1f} min ===')\n"
+    "\n"
+    "# Sync to Drive\n"
+    "!rsync -av /content/ckd_local/checkpoints/students/ /content/drive/MyDrive/CKD_Thesis/checkpoints/students/ 2>&1 | tail -5\n"
+    "!rsync -av /content/ckd_local/results/raw/ /content/drive/MyDrive/CKD_Thesis/results/raw/ 2>&1 | tail -5\n"
+    "\n"
+    "print('\\nAuto-disconnect in 60 seconds...')\n"
+    "time.sleep(60)\n"
+    "colab_runtime.unassign()\n"
+))
+
+# --------------------------------------------------------------------- #
+#  9. Continual gen3 with replay+ewc, 3 seeds
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 9. Continual distillation: gen2 → gen3 (`replay+ewc`, 3 seeds)\n"
+    "\n"
+    "Uses gen2's seed0 checkpoint as the anchor. Reports cross-gen retention metrics "
+    "(`auc_after` for gen1, gen2, gen3) and CGRS — the headline number for the thesis.\n"
+    "\n"
+    "Estimate: **~2 hours**. Auto-disconnects after.\n"
+))
+CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
+    "import time\n"
+    "from google.colab import runtime as colab_runtime\n"
+    "\n"
+    "PREV = '/content/ckd_local/checkpoints/students/gen2_replay+ewc_seed0/best.pth'\n"
+    "start = time.time()\n"
+    "print(f'=== Continual gen3 replay+ewc (3 seeds) started at {time.strftime(\"%Y-%m-%d %H:%M:%S\")} ===')\n"
+    "print(f'Previous checkpoint: {PREV}')\n"
+    "\n"
+    "!python -u scripts/05_continual_distillation.py \\\n"
+    "    --config configs/local.yaml \\\n"
+    "    --generation gen3 \\\n"
+    "    --method replay+ewc \\\n"
+    "    --previous-checkpoint $PREV \\\n"
+    "    --num-workers 2 \\\n"
+    "    --num-seeds 3\n"
+    "elapsed_min = (time.time() - start) / 60\n"
+    "print(f'\\n=== Continual gen3 DONE in {elapsed_min:.1f} min ===')\n"
+    "\n"
+    "# Sync to Drive\n"
+    "!rsync -av /content/ckd_local/checkpoints/students/ /content/drive/MyDrive/CKD_Thesis/checkpoints/students/ 2>&1 | tail -5\n"
+    "!rsync -av /content/ckd_local/results/raw/ /content/drive/MyDrive/CKD_Thesis/results/raw/ 2>&1 | tail -5\n"
+    "\n"
+    "print('\\nAuto-disconnect in 60 seconds...')\n"
+    "time.sleep(60)\n"
+    "colab_runtime.unassign()\n"
+))
+
+# --------------------------------------------------------------------- #
+#  10. Aggregate seeds
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 10. Aggregate per-seed metrics (mean +/- std)\n"
+    "\n"
+    "CPU runtime sufficient — no GPU needed. Reads `*_seed*.json` from `results/raw/` "
+    "and writes `*_aggregated.json` with mean and std for: `best_val_auc`, `cgrs`, "
+    "`avg_forgetting_*`, per-generation `auc_after`, and per-split test metrics.\n"
+    "\n"
+    "**This is the key cell for the thesis numbers.** Compare:\n"
+    "* Baseline (existing): `gen3_replay_continual_metrics.json` → CGRS 0.7523 (single seed)\n"
+    "* New (after this run): `gen3_replay+ewc_continual_metrics_aggregated.json` → "
+    "CGRS mean ± std (3 seeds)\n"
+    "* **Target: CGRS ≥ 0.83** (per Roadmap Rank 1+2+3 estimate).\n"
+))
+CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
+    "!python -u scripts/aggregate_seeds.py --config configs/local.yaml\n"
+    "\n"
+    "# Sync aggregated JSONs to Drive\n"
+    "!rsync -av /content/ckd_local/results/raw/ /content/drive/MyDrive/CKD_Thesis/results/raw/ 2>&1 | tail -3\n"
+    "\n"
+    "# Print headline numbers for sanity check\n"
+    "import json\n"
+    "from pathlib import Path\n"
+    "results = Path('/content/ckd_local/results/raw')\n"
+    "agg = sorted(results.glob('*_aggregated.json'))\n"
+    "print(f'\\n=== Aggregated runs ({len(agg)}) ===')\n"
+    "for p in agg:\n"
+    "    with open(p) as f:\n"
+    "        a = json.load(f)\n"
+    "    line = f'  {p.name}'\n"
+    "    if 'best_val_auc' in a:\n"
+    "        b = a['best_val_auc']\n"
+    "        line += f'  best_val_auc={b[\"mean\"]:.4f}±{b[\"std\"]:.4f}'\n"
+    "    if 'cgrs' in a:\n"
+    "        c = a['cgrs']\n"
+    "        line += f'  CGRS={c[\"mean\"]:.4f}±{c[\"std\"]:.4f}'\n"
+    "    if 'avg_forgetting_prev' in a:\n"
+    "        f_ = a['avg_forgetting_prev']\n"
+    "        line += f'  AvgF_prev={f_[\"mean\"]:.4f}±{f_[\"std\"]:.4f}'\n"
+    "    print(line)\n"
+))
+
+# --------------------------------------------------------------------- #
+#  11. Edge eval
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 11. Edge evaluation (TFLite fp32 / fp16 / int8)\n"
+    "\n"
+    "CPU runtime sufficient (TFLite benchmark runs on CPU by design — "
+    "edge deployment target is mobile/embedded). Converts each generation's "
+    "best checkpoint to TFLite and benchmarks latency + accuracy on the test split.\n"
+    "\n"
+    "Estimate: ~30–45 min (3 generations × 3 quantization modes).\n"
+))
+CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
     "for gen in ['gen1', 'gen2', 'gen3']:\n"
-    "    print(f'=== Soft labels for {gen} ===')\n"
-    "    !python scripts/03_generate_soft_labels.py --config configs/default.yaml --generation $gen\n"
-))
-
-CELLS.append(md(
-    "## 9. (Optional) Mirror hot data to Colab local SSD\n"
+    "    method_flag = '' if gen == 'gen1' else '--method replay+ewc'\n"
+    "    !python -u scripts/07_edge_evaluation.py \\\n"
+    "        --config configs/local.yaml \\\n"
+    "        --generation $gen $method_flag \\\n"
+    "        --modes fp32,fp16,int8 \\\n"
+    "        --num-runs 100\n"
     "\n"
-    "Reading 100 k face crops from Drive is slow. If runtime disk has enough room, rsync the current "
-    "generation's frames + soft labels to `/content/ckd_local` before training.\n"
-))
-CELLS.append(code(
-    "import shutil\n"
-    "src = '/content/drive/MyDrive/CKD_Thesis'\n"
-    "dst = '/content/ckd_local'\n"
-    "# Flip to True to enable.\n"
-    "ENABLE_HOTDATA = False\n"
-    "if ENABLE_HOTDATA:\n"
-    "    !mkdir -p $dst/datasets $dst/soft_labels\n"
-    "    !rsync -a --info=progress2 $src/datasets/splits/ $dst/datasets/splits/\n"
-    "    !rsync -a --info=progress2 $src/soft_labels/ $dst/soft_labels/\n"
-    "    print('Done mirroring. Point --hotdata-root at', dst, 'if your training script supports it.')\n"
-    "else:\n"
-    "    print('Hotdata mirroring disabled.')\n"
+    "# Sync edge results to Drive\n"
+    "!rsync -av /content/ckd_local/results/raw/ /content/drive/MyDrive/CKD_Thesis/results/raw/ 2>&1 | tail -3\n"
+    "!rsync -av /content/ckd_local/edge/ /content/drive/MyDrive/CKD_Thesis/edge/ 2>&1 | tail -3\n"
 ))
 
-CELLS.append(md("## 10. Initial distillation on gen1 (student = MobileNetV3-Large)"))
-CELLS.append(code(
-    "!python scripts/04_initial_distillation.py --config configs/default.yaml --generation gen1\n"
-))
-
+# --------------------------------------------------------------------- #
+#  12. Generate figures
+# --------------------------------------------------------------------- #
 CELLS.append(md(
-    "## 11. Continual distillation: gen1 → gen2\n"
+    "## 12. Generate thesis figures\n"
     "\n"
-    "Anti-forgetting method is selected via `--method` (one of `replay`, `ewc`, `lwf`). "
-    "We default to **replay** (small rehearsal buffer — typically best AUC/forgetting trade-off).\n"
+    "Reads aggregated metrics + edge results, writes PDFs to `results/figures/`.\n"
 ))
 CELLS.append(code(
-    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/students/gen1/best.pth'\n"
-    "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
-    "    --generation gen2 --method replay --previous-checkpoint $PREV\n"
-))
-
-CELLS.append(md(
-    "## 12. Continual distillation: gen2 → gen3\n"
-    "\n"
-    "Previous checkpoint path suffix changes for gen2 because script 05 writes under "
-    "`checkpoints/students/{gen}_{method}/best.pth` (so gen2+replay lives at `gen2_replay/`).\n"
-))
-CELLS.append(code(
-    "PREV = '/content/drive/MyDrive/CKD_Thesis/checkpoints/students/gen2_replay/best.pth'\n"
-    "!python scripts/05_continual_distillation.py --config configs/default.yaml \\\n"
-    "    --generation gen3 --method replay --previous-checkpoint $PREV\n"
-))
-
-CELLS.append(md(
-    "## 13. Edge evaluation (TFLite fp32 / fp16 / int8)\n"
-    "\n"
-    "Converts each generation's best checkpoint to TFLite variants and benchmarks inference "
-    "latency + accuracy on the test split.\n"
-))
-CELLS.append(code(
-    "# gen1 comes from scripts/04 (no --method). gen2/gen3 come from\n"
-    "# scripts/05 with method=replay, so we pass --method replay to help\n"
-    "# the script resolve the right checkpoint subdir.\n"
-    "for gen in ['gen1', 'gen2', 'gen3']:\n"
-    "    method_flag = '' if gen == 'gen1' else '--method replay'\n"
-    "    !python scripts/07_edge_evaluation.py --config configs/default.yaml \\\n"
-    "        --generation $gen $method_flag --modes fp32,fp16,int8 --num-runs 100\n"
-))
-
-CELLS.append(md("## 14. Generate thesis figures"))
-CELLS.append(code(
-    "!python scripts/08_generate_figures.py --config configs/default.yaml\n"
+    "%cd /content/ckd-deepfake\n"
+    "!python -u scripts/08_generate_figures.py --config configs/local.yaml\n"
+    "!rsync -av /content/ckd_local/results/figures/ /content/drive/MyDrive/CKD_Thesis/results/figures/ 2>&1 | tail -3\n"
     "!ls /content/drive/MyDrive/CKD_Thesis/results/figures\n"
 ))
 
+# --------------------------------------------------------------------- #
+#  13. Optional A6 ablation
+# --------------------------------------------------------------------- #
+CELLS.append(md(
+    "## 13. (Optional) A6 ablation: anti-forgetting method comparison\n"
+    "\n"
+    "**Skip this cell unless you have time + budget for the full ablation.** "
+    "Runs 5 methods (`ewc`, `lwf`, `replay`, `replay+ewc`, `der++`) × 3 seeds = "
+    "**15 continual gen2 runs**. Estimate: ~10–12 hours, ~64 compute units on A100.\n"
+    "\n"
+    "Pre-requisite: `gen1_seed0/best.pth` from cell 7 must exist.\n"
+    "\n"
+    "Output: `results/raw/ablation/A6/` with one metrics JSON per (method, seed). "
+    "Use `aggregate_seeds.py` again to summarise. The result tells you, on the same "
+    "underlying problem, whether `replay+ewc` is actually the best of the five — and "
+    "by how much (mean ± std).\n"
+    "\n"
+    "Auto-disconnects after.\n"
+))
+CELLS.append(code(
+    "%cd /content/ckd-deepfake\n"
+    "import time\n"
+    "from google.colab import runtime as colab_runtime\n"
+    "\n"
+    "start = time.time()\n"
+    "print(f'=== A6 ablation (5 methods × 3 seeds) started at {time.strftime(\"%Y-%m-%d %H:%M:%S\")} ===')\n"
+    "!python -u scripts/06_ablation_study.py \\\n"
+    "    --config configs/local.yaml \\\n"
+    "    --ablation A6 \\\n"
+    "    --seeds 0,1,2\n"
+    "elapsed_min = (time.time() - start) / 60\n"
+    "print(f'\\n=== A6 ablation DONE in {elapsed_min:.1f} min ({elapsed_min/60:.2f} hours) ===')\n"
+    "\n"
+    "!rsync -av /content/ckd_local/results/raw/ablation/ /content/drive/MyDrive/CKD_Thesis/results/raw/ablation/ 2>&1 | tail -3\n"
+    "!rsync -av /content/ckd_local/checkpoints/students/ablation/ /content/drive/MyDrive/CKD_Thesis/checkpoints/students/ablation/ 2>&1 | tail -3\n"
+    "\n"
+    "print('\\nAuto-disconnect in 60 seconds...')\n"
+    "time.sleep(60)\n"
+    "colab_runtime.unassign()\n"
+))
+
+# --------------------------------------------------------------------- #
+#  Done
+# --------------------------------------------------------------------- #
 CELLS.append(md(
     "---\n"
     "## Done 🎉\n"
     "\n"
-    "Deliverables on Drive:\n"
+    "**Deliverables on Drive (`{drive}/CKD_Thesis/`):**\n"
     "\n"
-    "- `checkpoints/students/gen{1,2,3}/best.pth` — student after each stage\n"
-    "- `results/edge_*.json` — TFLite latency/accuracy\n"
-    "- `results/figures/*.pdf` — thesis-ready plots (CDE, CGRS, S1–S3 heatmaps, latency bars)\n"
+    "* `soft_labels/{gen}/{train,val,test}/{efficientnet_b4,recce,clip_vit_l14,ensemble}.npy` — 3-teacher ensemble\n"
+    "* `soft_labels/{gen}/ensemble_weights.json` — per-teacher val AUC + ensemble weights\n"
+    "* `checkpoints/students/gen1_seed{0,1,2}/best.pth` — initial distillation, 3 seeds\n"
+    "* `checkpoints/students/gen2_replay+ewc_seed{0,1,2}/best.pth` — continual gen2, 3 seeds\n"
+    "* `checkpoints/students/gen3_replay+ewc_seed{0,1,2}/best.pth` — continual gen3, 3 seeds\n"
+    "* `results/raw/{gen}_*_aggregated.json` — mean ± std for thesis tables\n"
+    "* `results/raw/gen{1,2,3}_*_edge_metrics.json` — TFLite fp32/fp16/int8 latency + accuracy\n"
+    "* `results/figures/*.pdf` — thesis-ready plots\n"
+    "* `results/raw/ablation/A6/` — anti-forgetting method comparison (if cell 13 ran)\n"
+    "\n"
+    "**Compare baseline vs improved:**\n"
+    "\n"
+    "| Metric | Baseline (1 seed) | Target (3 seeds, replay+ewc) |\n"
+    "|---|---|---|\n"
+    "| CGRS | 0.7523 | ≥ 0.83 (≈ +0.08) |\n"
+    "| Avg forgetting (prev) | 0.3369 | ≤ 0.20 |\n"
+    "| Gen1 base AUC | 0.8012 | ≥ 0.82 (3-teacher boost) |\n"
+    "| Gen2 retention after gen3 | 0.4607 (52% drop) | ≥ 0.70 (≤ 25% drop) |\n"
+    "\n"
+    "Cell 10 prints the actual numbers — that's what goes in the thesis.\n"
 ))
 
 
