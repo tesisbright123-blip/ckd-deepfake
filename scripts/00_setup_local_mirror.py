@@ -147,11 +147,24 @@ def _required_zip_filenames(generations: list[str]) -> list[str]:
 
 
 def _extract_target(zip_name: str) -> Path:
-    """Where this zip should extract to under LOCAL_DATA."""
+    """Where this zip should extract to under LOCAL_DATA.
+
+    Technique zips (e.g. ``blendface.zip``) ship with a redundant root
+    folder named after the technique — internal layout is
+    ``blendface/frames/<vid>/000.png``. So we extract them to
+    ``/content/df40_local/df40/`` (parent) and the zip's root becomes
+    the technique folder, yielding ``df40/blendface/frames/<vid>/000.png``
+    which matches the CSV ``face_path`` after rewrite.
+
+    Real zips (FaceForensics++, Celeb-DF-v2) have their own override
+    targets in ``_EXTRACT_OVERRIDES`` — ``df40_real/ff_real/`` and
+    ``df40_real/cdf_real/`` — and their internal structure starts with
+    ``FaceForensics++/...`` / ``Celeb-DF-v2/...`` so the resulting paths
+    match CSV expectations.
+    """
     if zip_name in _EXTRACT_OVERRIDES:
         return LOCAL_DATA / _EXTRACT_OVERRIDES[zip_name]
-    stem = Path(zip_name).stem  # "blendface.zip" -> "blendface"
-    return LOCAL_DATA / "df40" / stem
+    return LOCAL_DATA / "df40"
 
 
 # ----------------------------------------------------------------------- #
@@ -192,28 +205,67 @@ def step1_copy_zips(
 #  Step 2 — Extract zips to LOCAL_DATA with correct subdir mapping
 # ----------------------------------------------------------------------- #
 
+def _per_zip_marker(zip_name: str) -> Path:
+    """Per-zip marker path so resume can skip individual zips even when
+    multiple zips share the same extract target dir (technique zips all
+    extract into ``LOCAL_DATA/df40/``).
+
+    Marker convention:
+      - Technique zip ``<stem>.zip`` -> marker at
+        ``LOCAL_DATA / df40 / <stem> / .extracted_ok`` (sits inside the
+        technique folder produced by the zip's redundant root).
+      - Real zip with override target -> marker inside the override dir
+        (one zip per dir, so dir-level marker is fine).
+    """
+    if zip_name in _EXTRACT_OVERRIDES:
+        return LOCAL_DATA / _EXTRACT_OVERRIDES[zip_name] / _EXTRACT_MARKER
+    stem = Path(zip_name).stem
+    return LOCAL_DATA / "df40" / stem / _EXTRACT_MARKER
+
+
 def step2_extract_local(
-    *, generations: list[str], resume: bool, logger
+    *, generations: list[str], resume: bool, logger,
+    delete_zip_after: bool = True,
 ) -> None:
+    """Extract each zip and write a per-zip marker.
+
+    With ``delete_zip_after=True`` (default), each zip's local copy is
+    removed after a successful extract. This frees ~50 GB on the Colab
+    /content disk so we don't run out of space mid-pipeline.
+    """
     LOCAL_DATA.mkdir(parents=True, exist_ok=True)
     needed = _required_zip_filenames(generations)
     logger.info("Step 2/6: extracting %d zips to %s", len(needed), LOCAL_DATA)
 
     for zname in needed:
         src = LOCAL_ZIPS / zname
-        if not src.is_file():
-            logger.warning("  [skip ] %s missing in local zips dir", zname)
-            continue
         target = _extract_target(zname)
-        marker = target / _EXTRACT_MARKER
+        marker = _per_zip_marker(zname)
         if resume and marker.is_file():
-            logger.info("  [skip ] %s already extracted -> %s", zname, target)
+            logger.info("  [skip ] %s already extracted (marker at %s)", zname, marker)
+            # Free local zip even if we skipped extract, to save disk.
+            if delete_zip_after and src.is_file():
+                src.unlink()
+                logger.info("  [free ] removed local zip copy %s", src)
+            continue
+        if not src.is_file():
+            logger.warning(
+                "  [skip ] %s missing in local zips dir (no extracted marker either)",
+                zname,
+            )
             continue
         target.mkdir(parents=True, exist_ok=True)
+        size_gb = src.stat().st_size / 1e9
+        logger.info("  [ext  ] %s (%.2f GB) -> %s", zname, size_gb, target)
         with zipfile.ZipFile(src) as zf:
             zf.extractall(target)
+        # Write marker AFTER successful extract; relies on the zip's
+        # redundant root folder existing for technique zips.
+        marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now().isoformat())
-        logger.info("  [ext  ] %s -> %s", zname, target)
+        if delete_zip_after:
+            src.unlink()
+            logger.info("  [free ] removed local zip %s after extract", src)
 
 
 # ----------------------------------------------------------------------- #
