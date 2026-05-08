@@ -68,6 +68,10 @@ class ContinualTrainerConfig:
     # Linear warmup epochs before cosine annealing kicks in. 1 is enough for
     # short continual rounds (10 epochs); 0 disables warmup.
     warmup_epochs: int = 1
+    # DER++ (Buzzega et al. 2020) MSE-on-stored-logits weight. Non-zero only
+    # when the active strategy provides per-row stored logits (DERReplayStrategy).
+    # Forwarded to ContinualDistillationLoss.alpha_der.
+    alpha_der: float = 0.0
 
 
 @dataclass
@@ -85,6 +89,7 @@ class ContinualEpochStats:
     val_accuracy: float
     lr: float
     kd_coverage: float = 0.0
+    train_der: float = 0.0
     extra: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, float]:
@@ -94,6 +99,7 @@ class ContinualEpochStats:
             "train_kd": float(self.train_kd),
             "train_retention": float(self.train_retention),
             "train_ce": float(self.train_ce),
+            "train_der": float(self.train_der),
             "train_penalty": float(self.train_penalty),
             "val_auc": float(self.val_auc),
             "val_log_loss": float(self.val_log_loss),
@@ -137,12 +143,15 @@ class ContinualTrainer:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Detect whether the strategy supplies previous-student logits on
-        # every batch. EWC and plain Replay don't — without renormalisation
-        # alpha+beta+gamma=1 collapses to alpha+gamma=0.7, making EWC/Replay
-        # implicitly receive 30% less gradient than LwF and breaking the
-        # cross-method ablation.
+        # every batch. EWC, plain Replay, Replay+EWC, and DER++ don't —
+        # without renormalisation alpha+beta+gamma=1 collapses to
+        # alpha+gamma=0.7, making them implicitly receive 30% less gradient
+        # than LwF and breaking cross-method ablation comparisons.
         has_retention = bool(getattr(strategy, "provides_retention_logits", False))
         retention_temp = getattr(strategy, "retention_temperature", None)
+        # DER++ contributes an additional MSE term — read alpha_der from
+        # the config (set non-zero only when method == "der++").
+        alpha_der = float(getattr(config, "alpha_der", 0.0))
         self.loss_fn = ContinualDistillationLoss(
             alpha=config.alpha,
             beta=config.beta,
@@ -150,6 +159,7 @@ class ContinualTrainer:
             temperature=config.temperature,
             retention_temperature=retention_temp,
             has_retention=has_retention,
+            alpha_der=alpha_der,
         )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -195,6 +205,7 @@ class ContinualTrainer:
                 train_kd=train_metrics["loss_kd"],
                 train_retention=train_metrics["loss_retention"],
                 train_ce=train_metrics["loss_ce"],
+                train_der=train_metrics.get("loss_der", 0.0),
                 train_penalty=train_metrics["loss_penalty"],
                 val_auc=val_metrics.auc,
                 val_log_loss=val_metrics.log_loss,
@@ -261,22 +272,37 @@ class ContinualTrainer:
             "loss_kd": 0.0,
             "loss_retention": 0.0,
             "loss_ce": 0.0,
+            "loss_der": 0.0,
             "loss_penalty": 0.0,
             "kd_coverage": 0.0,
         }
         n_batches = 0
 
         for step, batch in enumerate(loader):
-            images, hard_labels, soft_labels, _meta = batch
+            # Standard 4-tuple from build_dataloader / build_replay_dataloader:
+            #   (images, hard_labels, soft_labels, meta)
+            # DER++ 6-tuple from build_replay_dataloader_indexed:
+            #   (images, hard_labels, soft_labels, meta, stored_logits, mask)
+            stored_logits: torch.Tensor | None = None
+            stored_mask: torch.Tensor | None = None
+            if isinstance(batch, (tuple, list)) and len(batch) >= 6:
+                images, hard_labels, soft_labels, _meta, stored_logits, stored_mask = batch[:6]
+            else:
+                images, hard_labels, soft_labels, _meta = batch
             images = images.to(self.device, non_blocking=True)
             hard_labels = hard_labels.to(self.device, non_blocking=True)
             soft_labels = soft_labels.to(self.device, non_blocking=True).float()
+            if stored_logits is not None:
+                stored_logits = stored_logits.to(self.device, non_blocking=True).float()
+                stored_mask = stored_mask.to(self.device, non_blocking=True)
 
             prev_logits = self.strategy.previous_logits(self.model, images)
             logits = self.model(images)
 
             core_loss, metrics = self.loss_fn(
-                logits, hard_labels, soft_labels, prev_logits
+                logits, hard_labels, soft_labels, prev_logits,
+                stored_student_logits=stored_logits,
+                stored_logits_mask=stored_mask,
             )
             penalty = self.strategy.penalty(self.model)
             loss = core_loss + penalty
@@ -293,19 +319,21 @@ class ContinualTrainer:
             running["loss_kd"] += metrics["loss_kd"]
             running["loss_retention"] += metrics["loss_retention"]
             running["loss_ce"] += metrics["loss_ce"]
+            running["loss_der"] += metrics.get("loss_der", 0.0)
             running["loss_penalty"] += float(penalty.detach().item())
             running["kd_coverage"] += metrics["kd_coverage"]
             n_batches += 1
 
             if (step + 1) % self.config.log_every_n_steps == 0:
                 self.logger.info(
-                    "epoch=%d step=%d loss=%.4f kd=%.4f ret=%.4f ce=%.4f pen=%.4f cov=%.2f",
+                    "epoch=%d step=%d loss=%.4f kd=%.4f ret=%.4f ce=%.4f der=%.4f pen=%.4f cov=%.2f",
                     epoch,
                     step + 1,
                     float(loss.detach().item()),
                     metrics["loss_kd"],
                     metrics["loss_retention"],
                     metrics["loss_ce"],
+                    metrics.get("loss_der", 0.0),
                     float(penalty.detach().item()),
                     metrics["kd_coverage"],
                 )

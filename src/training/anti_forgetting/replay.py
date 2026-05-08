@@ -275,6 +275,56 @@ class ReplayStrategy(AntiForgettingStrategy):
         return np.concatenate(features, axis=0)
 
     # ------------------------------------------------------------------ #
+    #  Logit extraction (used by DER++ subclass)
+    # ------------------------------------------------------------------ #
+    def _extract_stored_logits(
+        self,
+        df_selected: pd.DataFrame,
+        *,
+        student_model: nn.Module,
+        device: str | torch.device,
+    ) -> np.ndarray:
+        """Forward selected exemplars through ``student_model`` (the
+        previous-generation student, frozen) and return ``(N, num_classes)``
+        logit array aligned to ``df_selected`` row order.
+
+        Used by :class:`~src.training.anti_forgetting.der_plus_plus.DERReplayStrategy`
+        to capture the logits the previous student produced on its own
+        exemplars, which DER++ later forces the current student to match
+        via MSE.
+        """
+        transform = build_transforms(mode="val", image_size=self.image_size)
+        student_model.eval()
+        student_model.to(device)
+
+        chunks: list[np.ndarray] = []
+        batch: list[torch.Tensor] = []
+
+        @torch.inference_mode()
+        def _flush() -> None:
+            nonlocal batch
+            if not batch:
+                return
+            x = torch.stack(batch, dim=0).to(device, non_blocking=True)
+            out = student_model(x)
+            chunks.append(out.detach().float().cpu().numpy())
+            batch = []
+
+        for path in df_selected["face_path"].tolist():
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img is None:
+                raise FileNotFoundError(f"DER++: failed to read {path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            batch.append(transform(image=img)["image"])
+            if len(batch) >= self.batch_size:
+                _flush()
+        _flush()
+
+        if not chunks:
+            raise RuntimeError("DER++: no logits extracted from buffer")
+        return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
+
+    # ------------------------------------------------------------------ #
     #  Buffer serialization
     # ------------------------------------------------------------------ #
     def _write_buffer(

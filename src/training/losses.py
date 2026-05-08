@@ -166,8 +166,13 @@ class ContinualDistillationLoss(nn.Module):
             as the teacher KD term is used.
         has_retention: Whether the active strategy will supply
             ``previous_student_logits`` on every batch. When ``False`` (e.g.
-            EWC, plain Replay) ``alpha`` and ``gamma`` are renormalised so the
-            two-term loss carries unit total weight.
+            EWC, plain Replay, DER++) ``alpha`` (and ``gamma``, plus
+            ``alpha_der`` if non-zero) are renormalised so the active terms
+            carry unit total weight.
+        alpha_der: Weight on the DER++ MSE-on-stored-logits term. Default 0.0
+            disables the term entirely; non-zero values activate it for
+            replay rows whose ``stored_logits_mask`` is ``True``. Buzzega
+            et al. 2020 use 0.5 as the canonical value.
     """
 
     def __init__(
@@ -178,9 +183,13 @@ class ContinualDistillationLoss(nn.Module):
         temperature: float = 4.0,
         retention_temperature: float | None = None,
         has_retention: bool = True,
+        alpha_der: float = 0.0,
     ) -> None:
         super().__init__()
-        for name, value in (("alpha", alpha), ("beta", beta), ("gamma", gamma)):
+        for name, value in (
+            ("alpha", alpha), ("beta", beta), ("gamma", gamma),
+            ("alpha_der", alpha_der),
+        ):
             if value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
         if temperature <= 0:
@@ -194,16 +203,23 @@ class ContinualDistillationLoss(nn.Module):
             self.alpha = float(alpha)
             self.beta = float(beta)
             self.gamma = float(gamma)
+            self.alpha_der = float(alpha_der)
         else:
-            denom = float(alpha + gamma)
+            # No retention term — renormalise the remaining active weights
+            # so total loss magnitude stays constant across methods (LwF
+            # vs EWC vs Replay vs DER++). When alpha_der > 0 it joins
+            # alpha + gamma in the denominator; otherwise just alpha + gamma.
+            denom = float(alpha + gamma + alpha_der)
             if denom <= 0:
                 raise ValueError(
-                    "When has_retention=False, alpha + gamma must be > 0 "
-                    f"(got alpha={alpha}, gamma={gamma})"
+                    "When has_retention=False, alpha + gamma + alpha_der "
+                    f"must be > 0 (got alpha={alpha}, gamma={gamma}, "
+                    f"alpha_der={alpha_der})"
                 )
             self.alpha = float(alpha) / denom
             self.beta = 0.0
             self.gamma = float(gamma) / denom
+            self.alpha_der = float(alpha_der) / denom
 
         self.temperature = float(temperature)
         self.retention_temperature = (
@@ -220,15 +236,27 @@ class ContinualDistillationLoss(nn.Module):
         hard_labels: torch.Tensor,
         soft_fake_prob: torch.Tensor,
         previous_student_logits: torch.Tensor | None,
+        stored_student_logits: torch.Tensor | None = None,
+        stored_logits_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Combined loss + per-component diagnostics.
 
         Args:
-            student_logits: ``(B, 2)`` logits from the current student.
+            student_logits: ``(B, num_classes)`` logits from the current student.
             hard_labels: ``(B,)`` int64 labels.
             soft_fake_prob: ``(B,)`` teacher ensemble ``P(fake)`` (or sentinel).
-            previous_student_logits: ``(B, 2)`` logits from the frozen previous
-                student, or ``None`` if retention is disabled for this batch.
+            previous_student_logits: ``(B, num_classes)`` logits from the
+                frozen previous student (LwF), or ``None`` if retention is
+                disabled for this batch.
+            stored_student_logits: ``(B, num_classes)`` logits the previous-
+                generation student emitted on the buffer's exemplars,
+                pre-computed at buffer-build time and looked up by row index
+                via ``IndexedConcatDataset``. Used by DER++. New-generation
+                rows have placeholder zeros — masked out by
+                ``stored_logits_mask``.
+            stored_logits_mask: ``(B,)`` bool. ``True`` for replay rows that
+                have valid stored logits. The MSE term applies only on
+                masked rows (zero contribution otherwise).
         """
         ce_loss = self.ce(student_logits, hard_labels.long())
 
@@ -253,16 +281,38 @@ class ContinualDistillationLoss(nn.Module):
         else:
             retention_loss = student_logits.new_zeros(())
 
+        # DER++: MSE between current student logits and stored previous-gen
+        # logits, restricted to replay rows (where the mask is True).
+        if (
+            stored_student_logits is not None
+            and stored_logits_mask is not None
+            and self.alpha_der > 0.0
+        ):
+            mask_bool = stored_logits_mask.bool()
+            if mask_bool.any():
+                stored = stored_student_logits.to(student_logits.device).detach()
+                der_loss = F.mse_loss(
+                    student_logits[mask_bool],
+                    stored[mask_bool],
+                    reduction="mean",
+                )
+            else:
+                der_loss = student_logits.new_zeros(())
+        else:
+            der_loss = student_logits.new_zeros(())
+
         total = (
             self.alpha * kd_loss
             + self.beta * retention_loss
             + self.gamma * ce_loss
+            + self.alpha_der * der_loss
         )
         metrics = {
             "loss": float(total.detach().item()),
             "loss_kd": float(kd_loss.detach().item()),
             "loss_retention": float(retention_loss.detach().item()),
             "loss_ce": float(ce_loss.detach().item()),
+            "loss_der": float(der_loss.detach().item()),
             "kd_coverage": coverage,
         }
         return total, metrics

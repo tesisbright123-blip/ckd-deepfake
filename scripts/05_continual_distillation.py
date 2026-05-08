@@ -97,7 +97,22 @@ def _seen_generations(generation: str) -> list[str]:
     return list(_GENERATION_ORDER[: idx + 1])
 
 
-def _build_trainer_config(training_cfg: dict) -> ContinualTrainerConfig:
+def _build_trainer_config(
+    training_cfg: dict,
+    *,
+    method: str = "",
+    af_cfg: dict | None = None,
+) -> ContinualTrainerConfig:
+    """Build trainer config from the YAML ``training.continual_distillation`` block.
+
+    For DER++ runs (``method == "der++"``) the ``alpha_der`` weight is
+    pulled from ``training.anti_forgetting.der.alpha_der``; for all other
+    methods it stays at 0.0 so the loss falls back to the standard
+    alpha*KD + beta*retention + gamma*CE form.
+    """
+    alpha_der = 0.0
+    if method.lower() == "der++" and af_cfg is not None:
+        alpha_der = float(af_cfg.get("der", {}).get("alpha_der", 0.5))
     return ContinualTrainerConfig(
         learning_rate=float(training_cfg.get("learning_rate", 5e-5)),
         weight_decay=float(training_cfg.get("weight_decay", 1e-4)),
@@ -109,6 +124,51 @@ def _build_trainer_config(training_cfg: dict) -> ContinualTrainerConfig:
         early_stopping_patience=int(
             training_cfg.get("early_stopping_patience", 3)
         ),
+        alpha_der=alpha_der,
+    )
+
+
+def _build_replay(
+    *,
+    af_cfg: dict,
+    previous_generation: str,
+    drive_root: Path,
+    buffer_output_dir: Path,
+    batch_size: int,
+    num_workers: int,
+    image_size: int,
+    aug_cfg: dict,
+) -> ReplayStrategy:
+    """Helper: construct a ReplayStrategy from the anti_forgetting config block."""
+    replay_cfg = af_cfg.get("replay", {})
+    return ReplayStrategy(
+        previous_train_csv=(
+            drive_root / "datasets" / "splits" / f"{previous_generation}_train.csv"
+        ),
+        previous_soft_label_path=(
+            drive_root
+            / "soft_labels"
+            / previous_generation
+            / "train"
+            / "ensemble.npy"
+        ),
+        buffer_output_dir=buffer_output_dir,
+        previous_generation=previous_generation,
+        buffer_percentage=float(replay_cfg.get("buffer_percentage", 0.10)),
+        selection=str(replay_cfg.get("selection", "herding")),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        image_size=image_size,
+        aug_cfg=aug_cfg,
+    )
+
+
+def _build_ewc(*, af_cfg: dict) -> EWCStrategy:
+    """Helper: construct an EWCStrategy from the anti_forgetting config block."""
+    ewc_cfg = af_cfg.get("ewc", {})
+    return EWCStrategy(
+        lambda_=float(ewc_cfg.get("lambda", 5000)),
+        fisher_samples=int(ewc_cfg.get("fisher_samples", 5000)),
     )
 
 
@@ -126,31 +186,45 @@ def _build_strategy(
 ) -> AntiForgettingStrategy:
     method = method.lower()
     af_cfg = cfg["training"]["anti_forgetting"]
+    replay_kwargs = dict(
+        af_cfg=af_cfg,
+        previous_generation=previous_generation,
+        drive_root=drive_root,
+        buffer_output_dir=buffer_output_dir,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        image_size=image_size,
+        aug_cfg=aug_cfg,
+    )
+
     if method == "ewc":
-        ewc_cfg = af_cfg.get("ewc", {})
-        return EWCStrategy(
-            lambda_=float(ewc_cfg.get("lambda", 5000)),
-            fisher_samples=int(ewc_cfg.get("fisher_samples", 1000)),
-        )
+        return _build_ewc(af_cfg=af_cfg)
     if method == "lwf":
         lwf_cfg = af_cfg.get("lwf", {})
         return LwFStrategy(temperature=float(lwf_cfg.get("temperature", 2.0)))
     if method == "replay":
+        return _build_replay(**replay_kwargs)
+    if method == "replay+ewc":
+        from src.training.anti_forgetting.combined import CombinedReplayEWCStrategy
+        return CombinedReplayEWCStrategy(
+            replay=_build_replay(**replay_kwargs),
+            ewc=_build_ewc(af_cfg=af_cfg),
+        )
+    if method == "der++":
+        from src.training.anti_forgetting.der_plus_plus import DERReplayStrategy
+        der_cfg = af_cfg.get("der", {})
         replay_cfg = af_cfg.get("replay", {})
-        return ReplayStrategy(
+        return DERReplayStrategy(
+            alpha_der=float(der_cfg.get("alpha_der", 0.5)),
             previous_train_csv=(
                 drive_root / "datasets" / "splits" / f"{previous_generation}_train.csv"
             ),
             previous_soft_label_path=(
-                drive_root
-                / "soft_labels"
-                / previous_generation
-                / "train"
-                / "ensemble.npy"
+                drive_root / "soft_labels" / previous_generation / "train" / "ensemble.npy"
             ),
             buffer_output_dir=buffer_output_dir,
             previous_generation=previous_generation,
-            buffer_percentage=float(replay_cfg.get("buffer_percentage", 0.05)),
+            buffer_percentage=float(replay_cfg.get("buffer_percentage", 0.10)),
             selection=str(replay_cfg.get("selection", "herding")),
             batch_size=batch_size,
             num_workers=num_workers,
@@ -158,7 +232,8 @@ def _build_strategy(
             aug_cfg=aug_cfg,
         )
     raise ValueError(
-        f"Unknown anti-forgetting method: {method!r}. Expected ewc / lwf / replay."
+        f"Unknown anti-forgetting method: {method!r}. "
+        "Expected one of: ewc / lwf / replay / replay+ewc / der++."
     )
 
 
@@ -196,11 +271,34 @@ def _peak_auc_from_previous_runs(
 
 
 def _run(args: argparse.Namespace) -> int:
+    """Top-level entry: dispatch single-seed or multi-seed run.
+
+    Multi-seed runs (``--num-seeds N`` with N>1) execute the training N
+    times sequentially with seeds 0..N-1 and write per-seed checkpoints +
+    metrics JSON. Use ``scripts/aggregate_seeds.py`` to compute mean/std
+    across the resulting JSONs.
+    """
+    if args.num_seeds <= 1:
+        return _run_single_seed(args, seed=args.seed)
+
+    last_rc = 0
+    for seed in range(args.num_seeds):
+        rc = _run_single_seed(args, seed=seed, seed_suffix=f"_seed{seed}")
+        last_rc = rc or last_rc
+    return last_rc
+
+
+def _run_single_seed(
+    args: argparse.Namespace, *, seed: int, seed_suffix: str = ""
+) -> int:
+    """Run one continual-distillation training pass with the given seed."""
     logger = get_logger(
         f"continual_distillation.{args.method}",
-        log_file=f"runs/continual_distillation_{args.generation}_{args.method}.log",
+        log_file=(
+            f"runs/continual_distillation_{args.generation}_{args.method}{seed_suffix}.log"
+        ),
     )
-    _seed_everything(args.seed)
+    _seed_everything(seed)
 
     cfg = load_config(args.config)
     drive_root = Path(cfg["paths"]["drive_root"])
@@ -212,7 +310,11 @@ def _run(args: argparse.Namespace) -> int:
 
     previous_generation = args.previous or _previous_generation(args.generation)
 
-    splits_dir = drive_root / "datasets" / "splits"
+    splits_dir = (
+        Path(args.splits_dir)
+        if args.splits_dir
+        else drive_root / "datasets" / "splits"
+    )
     new_split_csvs = {
         split: splits_dir / f"{args.generation}_{split}.csv"
         for split in ("train", "val", "test")
@@ -359,11 +461,18 @@ def _run(args: argparse.Namespace) -> int:
     )
 
     # --- Trainer -------------------------------------------------------
-    trainer_cfg = _build_trainer_config(training_cfg)
+    trainer_cfg = _build_trainer_config(
+        training_cfg,
+        method=args.method,
+        af_cfg=cfg["training"].get("anti_forgetting", {}),
+    )
     checkpoint_dir = (
         Path(args.checkpoint_dir)
         if args.checkpoint_dir
-        else drive_root / "checkpoints" / "students" / f"{args.generation}_{args.method}"
+        else drive_root
+        / "checkpoints"
+        / "students"
+        / f"{args.generation}_{args.method}{seed_suffix}"
     )
     trainer = ContinualTrainer(
         model=model,
@@ -375,7 +484,7 @@ def _run(args: argparse.Namespace) -> int:
         checkpoint_dir=checkpoint_dir,
         generation=args.generation,
         run_config={
-            "seed": args.seed,
+            "seed": seed,
             "method": args.method,
             "previous_generation": previous_generation,
             "previous_checkpoint": str(prev_ckpt_path),
@@ -442,6 +551,7 @@ def _run(args: argparse.Namespace) -> int:
         "best_val_auc": float(trainer.best_val_auc),
         "elapsed_seconds": float(getattr(trainer, "elapsed_seconds", 0.0)),
         "gpu_hours": float(getattr(trainer, "gpu_hours", 0.0)),
+        "seed": seed,
         "auc_after": auc_after,
         "auc_peak": auc_peak,
         **cgrs_block,
@@ -449,7 +559,7 @@ def _run(args: argparse.Namespace) -> int:
 
     metrics_path = (
         results_dir
-        / f"{args.generation}_{args.method}_continual_metrics.json"
+        / f"{args.generation}_{args.method}_continual_metrics{seed_suffix}.json"
     )
     write_metrics_json(
         metrics_path,
@@ -481,8 +591,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--method",
         required=True,
-        choices=["ewc", "lwf", "replay"],
-        help="Anti-forgetting strategy to use",
+        choices=["ewc", "lwf", "replay", "replay+ewc", "der++"],
+        help=(
+            "Anti-forgetting strategy: 'ewc' (Fisher penalty), 'lwf' "
+            "(Learning-without-Forgetting), 'replay' (herding buffer), "
+            "'replay+ewc' (data + weight protection combined), or "
+            "'der++' (Dark Experience Replay with stored logits)."
+        ),
     )
     p.add_argument(
         "--previous",
@@ -505,6 +620,20 @@ def _parse_args() -> argparse.Namespace:
         "--no-soft-labels",
         action="store_true",
         help="Ablation: skip the teacher KD term (gamma-only continual CE + retention)",
+    )
+    p.add_argument(
+        "--splits-dir",
+        default=None,
+        help="Override splits dir. Default: {drive}/datasets/splits. "
+        "Use this when reading from a local mirror to bypass Drive FUSE.",
+    )
+    p.add_argument(
+        "--num-seeds",
+        type=int,
+        default=1,
+        help="Run training N times with seeds 0..N-1, save metrics per-seed. "
+        "Default 1 (backward compat). Pass 3 for thesis-grade reporting "
+        "(mean +/- std via scripts/aggregate_seeds.py).",
     )
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--results-dir", default=None)

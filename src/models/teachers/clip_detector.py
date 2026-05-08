@@ -89,6 +89,40 @@ class CLIPDetectorTeacher(BaseTeacher):
     #  Loading
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _resolve_checkpoint_path(weight_path: str | Path) -> Path:
+        """Resolve actual on-disk checkpoint path, with fallback chain.
+
+        The CLIPping-the-Deception release ships as a project zip archive
+        renamed to ``.pth`` (~9 GB). We extract + remap into a clean
+        ``clip_clipping_fixed.pth`` (~1.7 GB). The default config points at
+        the fixed file, but we fall back to the legacy filename so users
+        who haven't run the extraction step yet still get a clear error
+        rather than a silent path miss.
+        """
+        primary = Path(weight_path)
+        # Build candidate list: requested path first, then legacy alternates
+        candidates: list[Path] = [primary]
+        sp = str(primary)
+        if sp.endswith("_fixed.pth"):
+            candidates.append(Path(sp[: -len("_fixed.pth")] + ".pth"))
+        elif sp.endswith(".pth"):
+            candidates.append(Path(sp[:-4] + "_fixed.pth"))
+
+        # A valid CLIP checkpoint should be at least 100 MB (visual tower alone)
+        for cand in candidates:
+            if cand.is_file() and cand.stat().st_size > 100_000_000:
+                if cand != primary:
+                    logger.warning(
+                        "CLIP checkpoint requested at %s not found, falling back to %s",
+                        primary, cand,
+                    )
+                return cand
+        raise FileNotFoundError(
+            f"No valid CLIP checkpoint found. Tried: {[str(c) for c in candidates]}. "
+            "Expected a >100 MB .pth file with visual tower + head weights."
+        )
+
     def load(self, weight_path: str | Path) -> None:
         try:
             import open_clip
@@ -98,6 +132,9 @@ class CLIPDetectorTeacher(BaseTeacher):
                 "Install with: pip install open_clip_torch"
             ) from exc
 
+        # Resolve actual path with fallback (handles legacy filename).
+        actual_path = self._resolve_checkpoint_path(weight_path)
+
         # Build visual tower from open_clip's registry.
         clip_model, _, _ = open_clip.create_model_and_transforms(
             "ViT-L-14",
@@ -106,7 +143,7 @@ class CLIPDetectorTeacher(BaseTeacher):
         visual = clip_model.visual  # ViT-L/14 image tower.
 
         # Peek at the checkpoint to figure out head output size.
-        state_dict = safe_load_state_dict(weight_path)
+        state_dict = safe_load_state_dict(actual_path)
         num_outputs = self._infer_head_outputs(state_dict)
         self._num_outputs = num_outputs
 
@@ -122,7 +159,7 @@ class CLIPDetectorTeacher(BaseTeacher):
                 "%s: %d missing keys when loading %s (first 3: %s)",
                 self.name,
                 len(missing),
-                weight_path,
+                actual_path,
                 missing[:3],
             )
         if unexpected:
@@ -130,7 +167,7 @@ class CLIPDetectorTeacher(BaseTeacher):
                 "%s: %d unexpected keys when loading %s (first 3: %s)",
                 self.name,
                 len(unexpected),
-                weight_path,
+                actual_path,
                 unexpected[:3],
             )
 
@@ -140,7 +177,7 @@ class CLIPDetectorTeacher(BaseTeacher):
         logger.info(
             "%s: loaded weights from %s (head_outputs=%d)",
             self.name,
-            weight_path,
+            actual_path,
             num_outputs,
         )
 

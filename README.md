@@ -34,14 +34,16 @@ See `configs/default.yaml -> data.generations` for the full per-gen technique li
 ## Pipeline
 
 ```
+00_setup_local_mirror    # ★ Colab-only: bypass Drive FUSE bottleneck (run first per session)
 01b_catalog_df40         # DF40 image tree -> metadata CSV (per generation)
 02_generate_splits       # 70/15/15 video-level splits
 03_generate_soft_labels  # teacher ensemble -> .npy
 04_initial_distillation  # student on Gen1
-05_continual_distillation# student on Gen2, Gen3 with anti-forgetting
-06_ablation_study        # A1..A5 sensitivity
+05_continual_distillation# student on Gen2, Gen3 with anti-forgetting (replay/ewc/lwf/replay+ewc/der++)
+06_ablation_study        # A1..A6 sensitivity (A6 = anti-forgetting method comparison)
 07_edge_evaluation       # TFLite conversion + latency benchmark
 08_generate_figures      # thesis figures / tables
+aggregate_seeds          # multi-seed run aggregator (mean +/- std)
 ```
 
 ## Project layout
@@ -80,6 +82,46 @@ Requires Colab Pro (A100 recommended) and a Google Drive folder at
 (~55 GB) and teacher checkpoints on first run, then executes the full
 pipeline (catalog → splits → soft labels → initial & continual
 distillation → edge eval → figures).
+
+> ⚠️ **Drive FUSE bottleneck — read this before training.**
+> Reading 700K+ small face crops directly from `/content/drive/MyDrive/`
+> via the Drive FUSE mount runs at **~2.5 fps** (each `cv2.imread` is an
+> HTTP API call). The same code reads from local Colab NVMe at **~368 fps**
+> — a **147× slowdown** purely from FUSE overhead. *Multi-threading does
+> not fix this; tar/rsync of the unzipped data is also too slow.*
+>
+> **Working pipeline:** zip archives are kept on Drive at
+> `datasets/raw/df40_zip_backup/`. The `scripts/00_setup_local_mirror.py`
+> script copies the needed zips to local NVMe (~9 min), extracts them
+> (~4 min), patches missing uniface frames (~30 s), and writes a
+> `configs/local.yaml` with `drive_root: /content/ckd_local`. Subsequent
+> training/inference scripts read from the local mirror at full GPU speed
+> while still writing checkpoints/results back to Drive.
+
+#### Colab Quickstart
+
+```python
+# 1. Mount Drive + clone repo
+from google.colab import drive
+drive.mount('/content/drive')
+!git clone --depth 1 https://TOKEN@github.com/tesisbright123-blip/ckd-deepfake.git /content/ckd-deepfake
+%cd /content/ckd-deepfake
+!pip install -q -r requirements.txt
+!pip install -e . -q
+
+# 2. ★ Set up local mirror (bypass FUSE bottleneck) — run once per session
+!python scripts/00_setup_local_mirror.py --generations all --resume
+
+# 3. Run training scripts against the local mirror
+!python -u scripts/03_generate_soft_labels.py --config configs/local.yaml --generation gen1 --num-workers 2
+!python -u scripts/04_initial_distillation.py --config configs/local.yaml --generation gen1 --num-seeds 3
+!python -u scripts/05_continual_distillation.py --config configs/local.yaml --generation gen2 --method replay+ewc --num-seeds 3
+# ... etc
+
+# 4. Sync checkpoints + results back to Drive (local mirror is ephemeral)
+!rsync -av /content/ckd_local/checkpoints/students/ /content/drive/MyDrive/CKD_Thesis/checkpoints/students/
+!rsync -av /content/ckd_local/results/raw/ /content/drive/MyDrive/CKD_Thesis/results/raw/
+```
 
 ## New metrics
 

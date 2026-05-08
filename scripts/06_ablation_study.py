@@ -15,6 +15,10 @@ Ablations (see ``_ABLATION_REGISTRY`` below for the concrete grids):
     A4: Student head capacity — initial distillation on gen1
     A5: Number of teachers (ensemble subsets) — requires pre-generated soft labels
         per subset under {drive}/soft_labels/{gen1}_{subset}/... (documented below)
+    A6: Anti-forgetting method comparison — continual gen2 with method in
+        {ewc, lwf, replay, replay+ewc, der++}. Buffer 10% baseline; same
+        learning rate / num_epochs / EWC lambda / LwF temperature across
+        all five variants. Pre-requisite: gen1 best.pth must exist.
 
 Each variant is orchestrated by writing a *temporary* YAML config with the
 override applied and invoking ``scripts/04_initial_distillation.py`` or
@@ -260,12 +264,53 @@ def _a5_teacher_count() -> list[Variant]:
     ]
 
 
+def _a6_anti_forgetting_methods() -> list[Variant]:
+    """A6 — Anti-forgetting method comparison (gen2 continual distillation).
+
+    Compares the five anti-forgetting strategies side-by-side, all with
+    the same buffer percentage (10%) and same gen2 task. Held constant:
+    learning rate, batch size, num epochs, replay selection (herding),
+    EWC lambda, LwF temperature.
+
+    Variants:
+        ewc           — Fisher penalty only
+        lwf           — Learning-without-Forgetting (KD on frozen prev student)
+        replay        — herding-selected exemplar buffer only
+        replay+ewc    — combine data + weight protection
+        der++         — Dark Experience Replay (logits MSE on stored logits)
+
+    Pre-requisite: gen1 initial-distillation checkpoint must exist at
+    ``{drive}/checkpoints/students/gen1/best.pth``. Each variant runs
+    scripts/05 with the matching --method flag and writes its own metrics
+    JSON under ``{drive}/results/raw/ablation/A6/<variant>_seed{N}.json``.
+    """
+    methods = ["ewc", "lwf", "replay", "replay+ewc", "der++"]
+    out: list[Variant] = []
+    for m in methods:
+        # File-system-safe variant name: replace + and ++ with English words.
+        safe_name = m.replace("++", "_pp").replace("+", "_plus")
+        out.append(
+            Variant(
+                name=safe_name,
+                description=f"Anti-forgetting method = {m} (gen2 continual)",
+                script="continual",
+                config_overrides={},
+                script_args={"--generation": "gen2", "--method": m},
+            )
+        )
+    return out
+
+
 _ABLATION_REGISTRY: dict[str, tuple[str, list[Variant]]] = {
     "A1": ("KD vs retention weight", _a1_alpha_beta()),
     "A2": ("KD temperature", _a2_temperature()),
     "A3": ("Replay buffer size", _a3_buffer_size()),
     "A4": ("Student head capacity", _a4_head_capacity()),
     "A5": ("Number of teachers", _a5_teacher_count()),
+    "A6": (
+        "Anti-forgetting method (ewc/lwf/replay/replay+ewc/der++)",
+        _a6_anti_forgetting_methods(),
+    ),
 }
 
 

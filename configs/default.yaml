@@ -13,7 +13,13 @@ teacher:
       ensemble_weight: auto
     - name: clip_vit_l14
       source: clipping
-      weight_path: "{drive}/checkpoints/teachers/clip_clipping.pth"
+      # The original CLIPping-the-Deception release ships as a project zip
+      # archive (not a PyTorch checkpoint). We extract the linear-probe
+      # checkpoint and remap keys (visual.* + head.*) into a clean
+      # ``clip_clipping_fixed.pth``. The loader auto-falls-back to the
+      # legacy ``clip_clipping.pth`` filename if the fixed one isn't on
+      # disk yet — see src/models/teachers/clip_detector.py.
+      weight_path: "{drive}/checkpoints/teachers/clip_clipping_fixed.pth"
       input_size: 224
       ensemble_weight: auto
   temperature: 4.0
@@ -127,20 +133,34 @@ training:
     gamma: 0.2
 
   anti_forgetting:
-    method: replay
+    # Default method:
+    #   - "replay" (vanilla)            : data-level protection only
+    #   - "ewc"                         : weight-level protection only
+    #   - "lwf"                         : Learning-without-Forgetting KD
+    #   - "replay+ewc"  (NEW, Phase 2) : combine data + weight protection
+    #   - "der++"        (NEW, Phase 3) : Dark Experience Replay (logits MSE)
+    method: replay+ewc
     ewc:
       lambda: 5000
       # Bumped 1000 -> 5000 to match Bhat et al. 2024 (EVCL, arXiv:2406.15972)
       # and because Fisher diagonal estimation needs more samples for deep
-      # networks (MobileNetV3-Large = ~5.4M params) than for the shallow MLPs
+      # networks (MobileNetV3-Large = ~4.4M params) than for the shallow MLPs
       # in the original EWC paper (Kirkpatrick 2017). Our gen-N val set is
       # ~7500 samples so 5000 fits comfortably.
       fisher_samples: 5000
     lwf:
       temperature: 2.0
     replay:
-      buffer_percentage: 0.05
+      # Bumped 0.05 -> 0.10 per CKD_CrossGen_Improvement_Roadmap.md Rank 1 —
+      # 5% buffer was too small to retain Gen2 distribution under Gen3 update
+      # (Gen2 forgetting hit 52%). 10% targets CGRS 0.80+ vs baseline 0.7523.
+      buffer_percentage: 0.10
       selection: herding
+    # DER++ (Buzzega et al., NeurIPS 2020) replay variant — only active when
+    # method == "der++". Stores per-exemplar student logits from the previous
+    # generation and adds an MSE term L_DER = MSE(student(x), stored_logits).
+    der:
+      alpha_der: 0.5
 
 # ===== Evaluation Config =====
 evaluation:

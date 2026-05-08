@@ -84,11 +84,38 @@ def _build_trainer_config(training_cfg: dict) -> TrainerConfig:
 
 
 def _run(args: argparse.Namespace) -> int:
+    """Top-level entry: dispatch single-seed or multi-seed run.
+
+    Multi-seed runs (``--num-seeds N`` with N>1) execute the training N
+    times sequentially with seeds 0..N-1 and write per-seed checkpoints +
+    metrics JSON. Use ``scripts/aggregate_seeds.py`` to compute mean/std
+    across the resulting JSONs.
+    """
+    if args.num_seeds <= 1:
+        return _run_single_seed(args, seed=args.seed)
+
+    last_rc = 0
+    for seed in range(args.num_seeds):
+        rc = _run_single_seed(args, seed=seed, seed_suffix=f"_seed{seed}")
+        last_rc = rc or last_rc
+    return last_rc
+
+
+def _run_single_seed(
+    args: argparse.Namespace, *, seed: int, seed_suffix: str = ""
+) -> int:
+    """Run one initial-distillation training pass with the given seed.
+
+    ``seed_suffix`` (e.g. ``"_seed0"``) is appended to checkpoint dir and
+    metrics filename so multi-seed runs don't clobber each other. When the
+    suffix is empty (single-seed run) outputs land at the historical paths
+    so existing artefacts stay backward-compatible.
+    """
     logger = get_logger(
         "initial_distillation",
-        log_file=f"runs/initial_distillation_{args.generation}.log",
+        log_file=f"runs/initial_distillation_{args.generation}{seed_suffix}.log",
     )
-    _seed_everything(args.seed)
+    _seed_everything(seed)
 
     cfg = load_config(args.config)
     drive_root = Path(cfg["paths"]["drive_root"])
@@ -98,7 +125,11 @@ def _run(args: argparse.Namespace) -> int:
     image_size = int(student_cfg.get("input_size", 224))
     batch_size = int(args.batch_size or training_cfg.get("batch_size", 64))
 
-    splits_dir = drive_root / "datasets" / "splits"
+    splits_dir = (
+        Path(args.splits_dir)
+        if args.splits_dir
+        else drive_root / "datasets" / "splits"
+    )
     split_csvs = {
         split: splits_dir / f"{args.generation}_{split}.csv"
         for split in ("train", "val", "test")
@@ -184,7 +215,7 @@ def _run(args: argparse.Namespace) -> int:
     checkpoint_dir = (
         Path(args.checkpoint_dir)
         if args.checkpoint_dir
-        else drive_root / "checkpoints" / "students" / args.generation
+        else drive_root / "checkpoints" / "students" / f"{args.generation}{seed_suffix}"
     )
     trainer = DistillationTrainer(
         model=model,
@@ -195,7 +226,7 @@ def _run(args: argparse.Namespace) -> int:
         checkpoint_dir=checkpoint_dir,
         generation=args.generation,
         run_config={
-            "seed": args.seed,
+            "seed": seed,
             "use_soft_labels": use_soft,
             "training": training_cfg,
             "student": student_cfg,
@@ -231,7 +262,9 @@ def _run(args: argparse.Namespace) -> int:
         if args.results_dir
         else drive_root / "results" / "raw"
     )
-    metrics_path = results_dir / f"{args.generation}_initial_metrics.json"
+    metrics_path = (
+        results_dir / f"{args.generation}_initial_metrics{seed_suffix}.json"
+    )
     write_metrics_json(
         metrics_path,
         generation=args.generation,
@@ -242,7 +275,7 @@ def _run(args: argparse.Namespace) -> int:
             "elapsed_seconds": float(getattr(trainer, "elapsed_seconds", 0.0)),
             "gpu_hours": float(getattr(trainer, "gpu_hours", 0.0)),
             "use_soft_labels": use_soft,
-            "seed": args.seed,
+            "seed": seed,
         },
     )
     logger.info("Wrote test metrics: %s", metrics_path)
@@ -268,6 +301,20 @@ def _parse_args() -> argparse.Namespace:
         "--no-soft-labels",
         action="store_true",
         help="Ablation: train with CE only, ignoring ensemble soft labels",
+    )
+    p.add_argument(
+        "--splits-dir",
+        default=None,
+        help="Override splits dir. Default: {drive}/datasets/splits. "
+        "Use this when reading from a local mirror to bypass Drive FUSE.",
+    )
+    p.add_argument(
+        "--num-seeds",
+        type=int,
+        default=1,
+        help="Run training N times with seeds 0..N-1, save metrics per-seed. "
+        "Default 1 (backward compat). Pass 3 for thesis-grade reporting "
+        "(mean +/- std via scripts/aggregate_seeds.py).",
     )
     p.add_argument("--checkpoint-dir", default=None)
     p.add_argument("--results-dir", default=None)

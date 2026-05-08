@@ -376,6 +376,42 @@ def _run(args: argparse.Namespace) -> int:
         name: compute_val_auc(splits["val"], val_labels)
         for name, splits in per_teacher_soft.items()
     }
+
+    # Weak-teacher gate: if 2+ teachers score at-or-below random (val AUC
+    # < 0.55), checkpoint loading is almost certainly broken — refuse to
+    # write a useless ensemble that would silently corrupt downstream
+    # training. Single weak teacher is OK because excess-AUC weighting will
+    # automatically down-weight it to ~0.
+    weak_teachers = [name for name, auc in per_teacher_auc.items() if auc < 0.55]
+    if len(weak_teachers) >= 2:
+        logger.error(
+            "================================================================"
+        )
+        logger.error(
+            "GATE FAIL: %d/%d teachers have val AUC < 0.55 (%s).",
+            len(weak_teachers), len(per_teacher_auc), weak_teachers,
+        )
+        logger.error(
+            "Per-teacher val AUC: %s",
+            {k: round(v, 4) for k, v in per_teacher_auc.items()},
+        )
+        logger.error(
+            "Aborting ensemble write — this typically means checkpoint "
+            "loading produced near-random predictions. Check the missing/"
+            "unexpected key warnings above for each teacher's load step. "
+            "Pass --teachers <subset> to run a known-good subset.",
+        )
+        logger.error(
+            "================================================================"
+        )
+        return 1
+    elif weak_teachers:
+        logger.warning(
+            "Weak teacher(s) detected (val AUC < 0.55): %s. Excess-AUC "
+            "weighting will down-weight these to near-zero in the ensemble.",
+            weak_teachers,
+        )
+
     weights = softmax_weights(
         per_teacher_auc,
         temperature=_WEIGHTING_TEMPERATURE,
