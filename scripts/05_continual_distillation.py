@@ -245,10 +245,23 @@ def _peak_auc_from_previous_runs(
     Checks, in order: the initial-distillation metrics for gen1, then any
     continual-distillation metrics whose generation matches. Returns ``None``
     if no prior JSON contains the key (the caller falls back gracefully).
+
+    Multi-seed naming: ``scripts/04`` and ``scripts/05`` write
+    ``..._seed{N}.json`` when ``--num-seeds > 1``. Earlier versions of this
+    function only globbed the single-seed pattern, so the peak lookup
+    silently returned None for multi-seed runs and the cgrs/forgetting
+    fallbacks collapsed to ``auc_after`` (yielding cgrs=1.0). We now glob
+    both naming conventions and take the max test AUC across all matches —
+    that's the model's true peak performance for the generation.
     """
     candidates = []
+    # Single-seed naming (legacy, --num-seeds 1)
     candidates.extend(results_dir.glob(f"{generation}_initial_metrics.json"))
     candidates.extend(results_dir.glob(f"{generation}_*_continual_metrics.json"))
+    # Multi-seed naming (--num-seeds N > 1) — added 2026-05-09 to fix
+    # cgrs=1.0 display bug when peak lookup couldn't match seed-suffixed files.
+    candidates.extend(results_dir.glob(f"{generation}_initial_metrics_seed*.json"))
+    candidates.extend(results_dir.glob(f"{generation}_*_continual_metrics_seed*.json"))
 
     best: float | None = None
     for path in candidates:

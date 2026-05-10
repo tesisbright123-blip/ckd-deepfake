@@ -131,6 +131,155 @@ def _collect_split_metric(
     return out
 
 
+def _peak_test_auc_for_gen(
+    results_dir: Path, gen: str, *, exclude_paths: set[str] | None = None,
+) -> tuple[float | None, str | None]:
+    """Find peak test AUC for a generation across ALL metrics JSONs.
+
+    Used to recompute CGRS post-hoc when scripts/05's
+    ``_peak_auc_from_previous_runs`` couldn't find peak (e.g. multi-seed
+    glob mismatch in older script versions, leading to cgrs=1.0 in
+    every per-seed continual JSON).
+
+    Looks at both single-seed and multi-seed naming patterns. For a
+    given generation ``gen``, the peak is the max ``splits.{gen}_test.auc``
+    across all matched files — that's the best the model ever achieved
+    on this generation's held-out test set.
+
+    Args:
+        exclude_paths: Optional set of file paths to ignore. Useful when
+            we want the peak-from-PRIOR-rounds (excluding files written
+            during the current generation's training, where retention has
+            already started degrading).
+
+    Returns: (peak_auc or None, source_file or None) for traceability.
+    """
+    patterns = [
+        f"{gen}_initial_metrics.json",
+        f"{gen}_initial_metrics_seed*.json",
+        f"{gen}_*_continual_metrics.json",
+        f"{gen}_*_continual_metrics_seed*.json",
+    ]
+    best: float | None = None
+    best_source: str | None = None
+    exclude_paths = exclude_paths or set()
+    for pat in patterns:
+        for path in results_dir.glob(pat):
+            if str(path) in exclude_paths:
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            splits = payload.get("splits") or {}
+            sp = splits.get(f"{gen}_test") or {}
+            auc = sp.get("auc")
+            if auc is None:
+                continue
+            try:
+                auc_f = float(auc)
+            except (TypeError, ValueError):
+                continue
+            if best is None or auc_f > best:
+                best = auc_f
+                best_source = str(path)
+    return best, best_source
+
+
+def _recompute_cgrs_from_peaks(
+    per_seed_payloads: list[dict[str, Any]],
+    *,
+    results_dir: Path,
+    current_generation: str | None,
+    logger,
+) -> dict[str, Any]:
+    """Post-hoc CGRS recomputation: for each seed in a continual run,
+    re-derive CGRS / avg_forgetting from ``auc_after`` + freshly-looked-up
+    per-gen peaks.
+
+    Why: legacy scripts/05 writes wrong CGRS when peak lookup glob misses
+    multi-seed files. We don't trust the cgrs/avg_forgetting fields in the
+    per-seed JSONs. We DO trust ``auc_after`` (which is computed correctly
+    from the trainer's eval pass) and the test AUCs in initial/earlier
+    continual metrics files.
+
+    Returns a partial dict to merge into the aggregated payload, with keys:
+      - peaks_used_for_correction: {gen: {auc, source}}
+      - cgrs_corrected: {mean, std, n}
+      - cgrs_corrected_per_seed: list[float]
+      - avg_forgetting_all_corrected: {mean, std, n}
+      - avg_forgetting_prev_corrected: {mean, std, n}
+    """
+    # Collect every gen mentioned in any seed's auc_after dict.
+    gen_keys: set[str] = set()
+    for p in per_seed_payloads:
+        aa = p.get("auc_after") or {}
+        gen_keys.update(aa.keys())
+    if not gen_keys:
+        return {}
+
+    # Look up peak for each gen across all metrics files. We exclude the
+    # current group's own JSONs from peak lookup so a continual run's own
+    # post-update AUC doesn't get used as the "peak" for the gen we just
+    # trained on (that would just reproduce auc_after = peak = 1.0 ratios).
+    own_paths = {p.get("_source_file") for p in per_seed_payloads if p.get("_source_file")}
+    peaks: dict[str, dict[str, Any]] = {}
+    for gen in sorted(gen_keys):
+        peak, source = _peak_test_auc_for_gen(
+            results_dir, gen, exclude_paths=own_paths,
+        )
+        if peak is not None:
+            peaks[gen] = {"auc": peak, "source": source}
+
+    if not peaks:
+        return {}
+
+    # Per-seed correct CGRS / avg_forgetting
+    cgrs_per_seed: list[float] = []
+    forg_all_per_seed: list[float] = []
+    forg_prev_per_seed: list[float] = []
+    for p in per_seed_payloads:
+        aa = p.get("auc_after") or {}
+        ratios: list[float] = []
+        forg_all: list[float] = []
+        forg_prev: list[float] = []
+        for gen, auc_after_g in aa.items():
+            peak_info = peaks.get(gen)
+            if peak_info is None or peak_info["auc"] <= 0:
+                continue
+            try:
+                a = float(auc_after_g)
+            except (TypeError, ValueError):
+                continue
+            peak = peak_info["auc"]
+            ratios.append(a / peak)
+            drop = peak - a
+            forg_all.append(drop)
+            if current_generation is None or gen != current_generation:
+                forg_prev.append(drop)
+        if ratios:
+            cgrs_per_seed.append(sum(ratios) / len(ratios))
+        if forg_all:
+            forg_all_per_seed.append(sum(forg_all) / len(forg_all))
+        if forg_prev:
+            forg_prev_per_seed.append(sum(forg_prev) / len(forg_prev))
+
+    out: dict[str, Any] = {
+        "peaks_used_for_correction": peaks,
+    }
+    if cgrs_per_seed:
+        out["cgrs_corrected"] = _mean_std(cgrs_per_seed)
+        out["cgrs_corrected_per_seed"] = cgrs_per_seed
+    if forg_all_per_seed:
+        out["avg_forgetting_all_corrected"] = _mean_std(forg_all_per_seed)
+        out["avg_forgetting_all_corrected_per_seed"] = forg_all_per_seed
+    if forg_prev_per_seed:
+        out["avg_forgetting_prev_corrected"] = _mean_std(forg_prev_per_seed)
+        out["avg_forgetting_prev_corrected_per_seed"] = forg_prev_per_seed
+    return out
+
+
 def _aggregate_one_group(
     group_key: str, files: list[tuple[int, Path]], logger,
 ) -> dict[str, Any]:
@@ -216,6 +365,26 @@ def _aggregate_one_group(
     if splits_aggregate:
         aggregated["splits"] = splits_aggregate
 
+    # Post-hoc corrected CGRS / forgetting — works around the legacy
+    # scripts/05 _peak_auc_from_previous_runs glob mismatch that wrote
+    # cgrs=1.0 / avg_forgetting=0.0 in every multi-seed continual JSON.
+    # We re-derive these from auc_after + per-gen peaks looked up across
+    # ALL per-seed metrics files. Original (broken) cgrs and
+    # avg_forgetting fields are still aggregated above for reference.
+    if auc_after_keys:
+        # Need the directory containing the per-seed JSONs
+        first_path = first.get("_source_file")
+        if first_path:
+            _results_dir = Path(first_path).parent
+            current_gen = aggregated.get("generation")
+            corrected = _recompute_cgrs_from_peaks(
+                per_seed_payloads,
+                results_dir=_results_dir,
+                current_generation=current_gen,
+                logger=None,
+            )
+            aggregated.update(corrected)
+
     return aggregated
 
 
@@ -268,8 +437,27 @@ def _run(args: argparse.Namespace) -> int:
         if "cgrs" in agg:
             c = agg["cgrs"]
             logger.info(
-                "       CGRS mean=%.4f std=%.4f", c["mean"], c["std"],
+                "       CGRS (raw, may be 1.0 due to legacy bug) mean=%.4f std=%.4f",
+                c["mean"], c["std"],
             )
+        if "cgrs_corrected" in agg:
+            cc = agg["cgrs_corrected"]
+            logger.info(
+                "       CGRS (CORRECTED post-hoc) mean=%.4f std=%.4f n=%d",
+                cc["mean"], cc["std"], cc["n"],
+            )
+        if "avg_forgetting_prev_corrected" in agg:
+            af = agg["avg_forgetting_prev_corrected"]
+            logger.info(
+                "       AvgF_prev (CORRECTED) mean=%.4f std=%.4f",
+                af["mean"], af["std"],
+            )
+        if "peaks_used_for_correction" in agg:
+            peaks_str = ", ".join(
+                f"{g}={info['auc']:.4f}"
+                for g, info in agg["peaks_used_for_correction"].items()
+            )
+            logger.info("       peaks_used: %s", peaks_str)
 
     logger.info("Done. %d aggregated JSON(s) written.", written)
     return 0
