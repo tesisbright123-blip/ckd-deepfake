@@ -434,10 +434,12 @@ def benchmark_tflite(
         latencies_ms.append((time.perf_counter() - start) * 1000.0)
 
     latencies_ms.sort()
+    n_minus_1 = len(latencies_ms) - 1
     return {
         "latency_ms_mean": float(statistics.fmean(latencies_ms)),
         "latency_ms_p50": float(statistics.median(latencies_ms)),
-        "latency_ms_p95": float(latencies_ms[int(0.95 * (len(latencies_ms) - 1))]),
+        "latency_ms_p95": float(latencies_ms[int(0.95 * n_minus_1)]),
+        "latency_ms_p99": float(latencies_ms[int(0.99 * n_minus_1)]),
         "num_runs": int(num_runs),
         "num_warmup": int(num_warmup),
     }
