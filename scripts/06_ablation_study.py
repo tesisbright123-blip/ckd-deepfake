@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -475,6 +476,201 @@ def _write_summary(
 
 
 # --------------------------------------------------------------------------- #
+#  Drive sync + resume helpers (defensive against Colab session resets)
+# --------------------------------------------------------------------------- #
+def _drive_sync_paths(
+    drive_sync_root: Path, ablation: str, variant: Variant, seed: int
+) -> tuple[Path, Path, Path]:
+    """Return (drive_results_dir, drive_checkpoint_dir, completion_marker).
+
+    The completion marker lives next to the metrics JSON so a simple
+    ``Path.is_file()`` check tells us whether the variant has finished
+    syncing to Drive previously.
+    """
+    drive_results_dir = (
+        drive_sync_root / "results" / "raw" / "ablation" / ablation / variant.name
+    )
+    drive_checkpoint_dir = (
+        drive_sync_root
+        / "checkpoints"
+        / "students"
+        / "ablation"
+        / ablation
+        / variant.name
+        / f"seed{seed}"
+    )
+    marker = drive_results_dir / f".completed_seed{seed}"
+    return drive_results_dir, drive_checkpoint_dir, marker
+
+
+def _is_variant_completed_on_drive(
+    drive_sync_root: Path | None,
+    ablation: str,
+    variant: Variant,
+    seed: int,
+) -> bool:
+    """Resume support: was this (variant, seed) successfully synced before?"""
+    if drive_sync_root is None:
+        return False
+    _, _, marker = _drive_sync_paths(drive_sync_root, ablation, variant, seed)
+    return marker.is_file()
+
+
+def _load_completed_metrics(
+    drive_sync_root: Path,
+    ablation: str,
+    variant: Variant,
+    seed: int,
+    generation: str,
+) -> dict[str, Any] | None:
+    """Read previously-synced metrics JSON from Drive for resume."""
+    drive_results_dir, _, _ = _drive_sync_paths(
+        drive_sync_root, ablation, variant, seed
+    )
+    # Look for both single-seed-named and multi-seed-named files.
+    candidates: list[Path] = []
+    if variant.script == "initial":
+        candidates.append(drive_results_dir / f"{generation}_initial_metrics.json")
+        candidates.append(drive_results_dir / f"{generation}_initial_metrics_seed{seed}.json")
+    else:
+        method = variant.script_args.get("--method", "")
+        candidates.append(
+            drive_results_dir / f"{generation}_{method}_continual_metrics.json"
+        )
+        candidates.append(
+            drive_results_dir
+            / f"{generation}_{method}_continual_metrics_seed{seed}.json"
+        )
+    for c in candidates:
+        if c.is_file():
+            return _load_metrics(c)
+    return None
+
+
+def _copy_file_safe(src: Path, dst: Path, *, logger) -> bool:
+    """Copy with mkdir parent, robust to FUSE quirks. Returns success."""
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        return True
+    except OSError as exc:
+        logger.error("Copy failed %s -> %s: %s", src, dst, exc)
+        return False
+
+
+def _sync_variant_to_drive(
+    *,
+    drive_sync_root: Path,
+    local_results_dir: Path,
+    local_checkpoint_dir: Path,
+    ablation: str,
+    variant: Variant,
+    seed: int,
+    metrics_filename: str,
+    logger,
+) -> bool:
+    """Copy variant outputs from local NVMe to Drive immediately after run.
+
+    This is the defense against Colab session resets — even if the runtime
+    dies before the orchestrator can finish, every previously-completed
+    variant is already on Drive.
+
+    Writes the completion marker LAST (atomic-ish — if the marker exists,
+    callers know the metrics+ckpt are both there).
+
+    Returns True on full success, False if any required artifact was missing.
+    """
+    drive_results_dir, drive_checkpoint_dir, marker = _drive_sync_paths(
+        drive_sync_root, ablation, variant, seed
+    )
+
+    success = True
+
+    # 1. Sync metrics JSON (required)
+    local_metrics = local_results_dir / metrics_filename
+    if local_metrics.is_file():
+        drive_metrics = drive_results_dir / metrics_filename
+        if not _copy_file_safe(local_metrics, drive_metrics, logger=logger):
+            success = False
+        else:
+            logger.info("  [sync ] metrics -> %s", drive_metrics)
+    else:
+        logger.warning("  [sync ] no metrics JSON at %s -> skipping marker", local_metrics)
+        return False
+
+    # 2. Sync best.pth (optional but desirable for reproducibility)
+    local_best = local_checkpoint_dir / "best.pth"
+    if local_best.is_file():
+        drive_best = drive_checkpoint_dir / "best.pth"
+        if _copy_file_safe(local_best, drive_best, logger=logger):
+            size_mb = drive_best.stat().st_size / 1e6
+            logger.info("  [sync ] checkpoint -> %s (%.1f MB)", drive_best, size_mb)
+
+    # 3. Sync child script log if present (helpful for debugging variant-specific issues)
+    method = variant.script_args.get("--method")
+    gen = variant.script_args.get("--generation", "gen1")
+    child_log_candidates = []
+    if variant.script == "initial":
+        child_log_candidates.append(Path("runs") / f"initial_distillation_{gen}.log")
+    else:
+        child_log_candidates.append(
+            Path("runs") / f"continual_distillation_{gen}_{method}.log"
+        )
+    for log_src in child_log_candidates:
+        if log_src.is_file():
+            log_dst = drive_results_dir / log_src.name
+            _copy_file_safe(log_src, log_dst, logger=logger)
+
+    # 4. Write completion marker LAST so partial syncs are not misread as done.
+    if success:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "completed_at": datetime.now(timezone.utc).strftime(_TIMESTAMP_FMT),
+                    "variant": variant.name,
+                    "seed": seed,
+                    "metrics_filename": metrics_filename,
+                },
+                indent=2,
+            )
+        )
+        logger.info("  [sync ] marker -> %s", marker)
+    return success
+
+
+def _update_progress_summary(
+    *,
+    drive_sync_root: Path,
+    ablation: str,
+    label: str,
+    variants: list[Variant],
+    runs: list[dict[str, Any]],
+    base_config_path: Path,
+    is_final: bool,
+) -> None:
+    """Write/update the cross-variant summary JSON on Drive.
+
+    Called after each variant so that even a partial run leaves a
+    structured record. The ``is_final`` flag flips a top-level boolean
+    so consumers can detect whether the summary represents a finished
+    grid or an in-progress one.
+    """
+    summary_dir = drive_sync_root / "results" / "raw" / "ablation"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    suffix = "_summary.json" if is_final else "_progress.json"
+    summary_path = summary_dir / f"{ablation}{suffix}"
+    _write_summary(
+        summary_path,
+        ablation=ablation,
+        label=label,
+        variants=variants,
+        runs=runs,
+        base_config_path=base_config_path,
+    )
+
+
+# --------------------------------------------------------------------------- #
 #  Run loop
 # --------------------------------------------------------------------------- #
 def _list_ablations() -> None:
@@ -534,6 +730,22 @@ def _run(args: argparse.Namespace) -> int:
     resolved_cfg = load_config(args.config)
     drive_root = Path(resolved_cfg["paths"]["drive_root"])
 
+    drive_sync_root = (
+        Path(args.drive_sync_root).expanduser().resolve()
+        if args.drive_sync_root
+        else None
+    )
+    if drive_sync_root is not None:
+        logger.info("Drive sync target: %s", drive_sync_root)
+        if args.resume:
+            logger.info("Resume mode: variants with completion markers on Drive will be skipped")
+    elif args.resume:
+        logger.warning(
+            "--resume passed without --drive-sync-root; resume will rely on the "
+            "local drive_root (%s) which is NVMe-ephemeral on Colab.",
+            drive_root,
+        )
+
     base_config_path = Path(args.config).resolve()
     runs: list[dict[str, Any]] = []
 
@@ -553,6 +765,34 @@ def _run(args: argparse.Namespace) -> int:
                     drive_root, args.ablation, variant, seed
                 )
                 results_dir.mkdir(parents=True, exist_ok=True)
+
+                # Resume: skip variants already synced to Drive.
+                if args.resume and drive_sync_root is not None and _is_variant_completed_on_drive(
+                    drive_sync_root, args.ablation, variant, seed
+                ):
+                    metrics = _load_completed_metrics(
+                        drive_sync_root, args.ablation, variant, seed, generation
+                    )
+                    summary_entry = _summarize_variant_run(variant, seed, metrics)
+                    summary_entry["status"] = "skipped (resume — already on Drive)"
+                    runs.append(summary_entry)
+                    logger.info(
+                        "[skip ] variant=%s seed=%d (resume — completion marker on Drive)",
+                        variant.name,
+                        seed,
+                    )
+                    # Keep progress summary in sync as we skip pre-completed cells.
+                    if drive_sync_root is not None:
+                        _update_progress_summary(
+                            drive_sync_root=drive_sync_root,
+                            ablation=args.ablation,
+                            label=label,
+                            variants=variants,
+                            runs=runs,
+                            base_config_path=base_config_path,
+                            is_final=False,
+                        )
+                    continue
 
                 logger.info(
                     "-> variant=%s seed=%d (%s)",
@@ -597,6 +837,17 @@ def _run(args: argparse.Namespace) -> int:
                             "status": f"failed (rc={rc})",
                         }
                     )
+                    # Update progress summary even on failures, so we can resume past them.
+                    if drive_sync_root is not None:
+                        _update_progress_summary(
+                            drive_sync_root=drive_sync_root,
+                            ablation=args.ablation,
+                            label=label,
+                            variants=variants,
+                            runs=runs,
+                            base_config_path=base_config_path,
+                            is_final=False,
+                        )
                     if args.fail_fast:
                         return rc
                     continue
@@ -612,6 +863,37 @@ def _run(args: argparse.Namespace) -> int:
                     "   ok: %s (metrics=%s)", variant.name, metrics_path
                 )
 
+                # Sync this variant to Drive immediately so a later session
+                # reset cannot wipe its results.
+                if drive_sync_root is not None and metrics_path.is_file():
+                    sync_ok = _sync_variant_to_drive(
+                        drive_sync_root=drive_sync_root,
+                        local_results_dir=results_dir,
+                        local_checkpoint_dir=checkpoint_dir,
+                        ablation=args.ablation,
+                        variant=variant,
+                        seed=seed,
+                        metrics_filename=metrics_path.name,
+                        logger=logger,
+                    )
+                    if not sync_ok:
+                        logger.warning(
+                            "Drive sync incomplete for variant=%s seed=%d — "
+                            "result file may not be on Drive yet.",
+                            variant.name,
+                            seed,
+                        )
+                    # Always refresh the progress summary so a partial run is recoverable.
+                    _update_progress_summary(
+                        drive_sync_root=drive_sync_root,
+                        ablation=args.ablation,
+                        label=label,
+                        variants=variants,
+                        runs=runs,
+                        base_config_path=base_config_path,
+                        is_final=False,
+                    )
+
     summary_path = (
         drive_root / "results" / "raw" / "ablation" / f"{args.ablation}_summary.json"
     )
@@ -623,7 +905,26 @@ def _run(args: argparse.Namespace) -> int:
         runs=runs,
         base_config_path=base_config_path,
     )
-    logger.info("Wrote ablation summary: %s", summary_path)
+    logger.info("Wrote local ablation summary: %s", summary_path)
+
+    if drive_sync_root is not None:
+        # Final summary on Drive (replaces the progress file's role).
+        drive_summary_path = (
+            drive_sync_root
+            / "results"
+            / "raw"
+            / "ablation"
+            / f"{args.ablation}_summary.json"
+        )
+        _write_summary(
+            drive_summary_path,
+            ablation=args.ablation,
+            label=label,
+            variants=variants,
+            runs=runs,
+            base_config_path=base_config_path,
+        )
+        logger.info("Wrote final Drive ablation summary: %s", drive_summary_path)
     return 0
 
 
@@ -665,6 +966,28 @@ def _parse_args() -> argparse.Namespace:
         "--list",
         action="store_true",
         help="Print the ablation registry and exit",
+    )
+    p.add_argument(
+        "--drive-sync-root",
+        default=None,
+        help=(
+            "Persistent Drive path to copy per-variant artefacts into AFTER "
+            "each variant completes (defensive against Colab session resets). "
+            "Typical Colab value: "
+            "'/content/drive/MyDrive/CKD_Thesis' (regardless of where the "
+            "config's drive_root points). When set, also writes a "
+            "<ablation>_progress.json next to each completion, plus a final "
+            "<ablation>_summary.json."
+        ),
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Skip variants that already have a completion marker on "
+            "--drive-sync-root. Without --drive-sync-root, this flag has no "
+            "effect on Colab because the NVMe state is ephemeral."
+        ),
     )
     return p.parse_args()
 

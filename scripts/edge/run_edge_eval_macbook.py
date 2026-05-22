@@ -74,6 +74,12 @@ logger = get_logger(__name__)
 
 ON_MACOS = platform.system() == "Darwin"
 
+# Per-checkpoint result file format. Each (run_tag) gets a JSON immediately
+# after its conversion + eval completes; the orchestrator can resume by
+# scanning these. Final aggregate JSON is built by merging all per-ckpt
+# files at the end.
+_PER_CKPT_FILE_FMT = "per_ckpt_{run_tag}.json"
+
 # Checkpoint definitions: (run_tag, ckpt_relative_path_under_students)
 CHECKPOINT_TAGS: list[tuple[str, str]] = [
     ("gen1_seed0", "gen1_seed0/best.pth"),
@@ -603,6 +609,15 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Convert and sanity-check only the first checkpoint (debugging)",
     )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Skip checkpoints that already have a per-ckpt JSON in "
+            "{output-dir}/results/per_ckpt_<run_tag>.json. Useful when "
+            "rerunning after a crash — keeps previously-completed work."
+        ),
+    )
     return p.parse_args()
 
 
@@ -717,58 +732,98 @@ def _run(args: argparse.Namespace) -> int:
         logger.info("--pilot-only set — stopping after sanity check.")
         return 0
 
-    # --- Mass conversion + eval ------------------------------------------
-    all_artifacts: dict[str, dict[str, Path]] = {pilot_tag: pilot_artifacts}
-    for run_tag, ckpt_rel in CHECKPOINT_TAGS[1:]:
-        ckpt = ckpt_root / ckpt_rel
-        if not ckpt.is_file():
-            logger.warning("Checkpoint missing — skipping %s (%s)", run_tag, ckpt)
-            continue
-        logger.info("Converting %s ...", run_tag)
-        model, _ = _load_student(ckpt, student_cfg=student_cfg)
-        all_artifacts[run_tag] = _convert_one_checkpoint(
-            model,
-            run_tag=run_tag,
-            conversion_root=conversion_root,
-            representative_loader=calib_loader,
-            image_size=image_size,
-            calibration_batches=args.calibration_batches,
-            coreml_enabled=coreml_enabled,
-        )
-
     # --- AUC eval --------------------------------------------------------
     eval_rows: list[EvalRow] = []
 
     # PyTorch baseline (CPU) for the gen3 seed-0 final model — reference number.
-    logger.info("PyTorch CPU baseline (reference) ...")
-    pt_ckpt = ckpt_root / "gen3_replay+ewc_seed0/best.pth"
-    if pt_ckpt.is_file():
-        pt_model, _ = _load_student(pt_ckpt, student_cfg=student_cfg)
-        for split, loader in test_loaders.items():
-            pt = _evaluate_pytorch_baseline(pt_model, loader)
-            eval_rows.append(
-                EvalRow(
-                    run_tag="gen3_replay+ewc_seed0",
-                    runtime="pytorch",
-                    mode="fp32",
-                    test_split=split,
-                    num_samples=pt["num_samples"],
-                    auc=pt["auc"],
-                    log_loss=pt["log_loss"],
-                    accuracy=pt["accuracy"],
-                    artifact_path=str(pt_ckpt),
-                    size_mb=file_size_mb(pt_ckpt),
+    # Persisted as its own per-ckpt row tagged "pytorch_baseline" so --resume
+    # can skip it on a re-run.
+    pytorch_baseline_tag = "pytorch_baseline_gen3seed0"
+    pt_existing = (
+        _load_per_ckpt(results_dir, pytorch_baseline_tag) if args.resume else None
+    )
+    if pt_existing is not None:
+        logger.info(
+            "PyTorch CPU baseline: loaded %d row(s) from cache", len(pt_existing)
+        )
+        eval_rows.extend(pt_existing)
+    else:
+        logger.info("PyTorch CPU baseline (reference) ...")
+        pt_ckpt = ckpt_root / "gen3_replay+ewc_seed0/best.pth"
+        pt_rows: list[EvalRow] = []
+        if pt_ckpt.is_file():
+            pt_model, _ = _load_student(pt_ckpt, student_cfg=student_cfg)
+            for split, loader in test_loaders.items():
+                pt = _evaluate_pytorch_baseline(pt_model, loader)
+                pt_rows.append(
+                    EvalRow(
+                        run_tag="gen3_replay+ewc_seed0",
+                        runtime="pytorch",
+                        mode="fp32",
+                        test_split=split,
+                        num_samples=pt["num_samples"],
+                        auc=pt["auc"],
+                        log_loss=pt["log_loss"],
+                        accuracy=pt["accuracy"],
+                        artifact_path=str(pt_ckpt),
+                        size_mb=file_size_mb(pt_ckpt),
+                    )
                 )
-            )
-            logger.info(
-                "  pytorch fp32 %s: auc=%.4f n=%d",
-                split,
-                pt["auc"],
-                pt["num_samples"],
+                logger.info(
+                    "  pytorch fp32 %s: auc=%.4f n=%d",
+                    split,
+                    pt["auc"],
+                    pt["num_samples"],
+                )
+            eval_rows.extend(pt_rows)
+            _save_per_ckpt(
+                results_dir=results_dir,
+                run_tag=pytorch_baseline_tag,
+                rows=pt_rows,
+                artifacts={"pytorch_fp32": pt_ckpt},
             )
 
-    # Edge artifacts: TFLite + CoreML, all 9 ckpts x all splits.
-    for run_tag, artifacts in all_artifacts.items():
+    # --- Mass conversion + per-checkpoint eval (with resume) -------------
+    # Each checkpoint is fully processed (convert + eval all formats/splits)
+    # then its per-ckpt JSON is written atomically. Crashing mid-loop loses
+    # only the in-flight checkpoint, not all completed ones.
+    all_artifacts: dict[str, dict[str, Path]] = {pilot_tag: pilot_artifacts}
+    for run_tag, ckpt_rel in CHECKPOINT_TAGS:
+        # Resume short-circuit: if per-ckpt JSON exists, load it and skip work.
+        cached = _load_per_ckpt(results_dir, run_tag) if args.resume else None
+        if cached is not None:
+            logger.info(
+                "[resume] %s: loaded %d row(s) from per-ckpt cache",
+                run_tag,
+                len(cached),
+            )
+            eval_rows.extend(cached)
+            continue
+
+        ckpt = ckpt_root / ckpt_rel
+        if not ckpt.is_file():
+            logger.warning("Checkpoint missing — skipping %s (%s)", run_tag, ckpt)
+            continue
+
+        # Convert if not already done (pilot's artifacts are reused).
+        if run_tag == pilot_tag and pilot_artifacts:
+            artifacts = pilot_artifacts
+        else:
+            logger.info("Converting %s ...", run_tag)
+            model, _ = _load_student(ckpt, student_cfg=student_cfg)
+            artifacts = _convert_one_checkpoint(
+                model,
+                run_tag=run_tag,
+                conversion_root=conversion_root,
+                representative_loader=calib_loader,
+                image_size=image_size,
+                calibration_batches=args.calibration_batches,
+                coreml_enabled=coreml_enabled,
+            )
+        all_artifacts[run_tag] = artifacts
+
+        # Eval all (format, split) for this checkpoint, then save per-ckpt JSON.
+        ckpt_rows: list[EvalRow] = []
         for key, art_path in artifacts.items():
             runtime, mode = key.split("_", 1)
             if runtime == "coreml" and not (ON_MACOS and coreml_enabled):
@@ -791,7 +846,7 @@ def _run(args: argparse.Namespace) -> int:
                         exc,
                     )
                     continue
-                eval_rows.append(
+                ckpt_rows.append(
                     EvalRow(
                         run_tag=run_tag,
                         runtime=runtime,
@@ -814,6 +869,16 @@ def _run(args: argparse.Namespace) -> int:
                     res["auc"],
                     res["num_samples"],
                 )
+
+        if ckpt_rows:
+            saved = _save_per_ckpt(
+                results_dir=results_dir,
+                run_tag=run_tag,
+                rows=ckpt_rows,
+                artifacts=artifacts,
+            )
+            logger.info("[save] per-ckpt -> %s", saved)
+            eval_rows.extend(ckpt_rows)
 
     # --- Latency benchmark on pilot only --------------------------------
     logger.info("Latency benchmark (pilot=%s) ...", pilot_tag)
@@ -878,6 +943,67 @@ def _mlpackage_size_mb_safe(path: Path) -> float:
         return _mlpackage_size_mb(path)
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def _per_ckpt_path(results_dir: Path, run_tag: str) -> Path:
+    """Per-checkpoint result file location.
+
+    Each checkpoint's full eval (4 formats x 3 splits = up to 12 rows) is
+    persisted to this file IMMEDIATELY after that checkpoint's eval
+    finishes — so a session crash mid-loop does not lose previously-
+    completed checkpoints.
+    """
+    return results_dir / _PER_CKPT_FILE_FMT.format(run_tag=run_tag)
+
+
+def _save_per_ckpt(
+    *,
+    results_dir: Path,
+    run_tag: str,
+    rows: list[EvalRow],
+    artifacts: dict[str, Path],
+) -> Path:
+    """Write the per-checkpoint JSON atomically (tmp file + rename)."""
+    target = _per_ckpt_path(results_dir, run_tag)
+    tmp = target.with_suffix(".json.tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_tag": run_tag,
+        "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+        "artifacts": {k: str(v) for k, v in artifacts.items()},
+        "rows": [r.as_dict() for r in rows],
+    }
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(target)
+    return target
+
+
+def _load_per_ckpt(results_dir: Path, run_tag: str) -> list[EvalRow] | None:
+    """Reload a previously-saved per-checkpoint result. None = not present."""
+    target = _per_ckpt_path(results_dir, run_tag)
+    if not target.is_file():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    rows: list[EvalRow] = []
+    for r in payload.get("rows", []):
+        rows.append(
+            EvalRow(
+                run_tag=str(r["run_tag"]),
+                runtime=str(r["runtime"]),
+                mode=str(r["mode"]),
+                test_split=str(r["test_split"]),
+                num_samples=int(r["num_samples"]),
+                auc=float(r["auc"]),
+                log_loss=float(r["log_loss"]),
+                accuracy=float(r["accuracy"]),
+                artifact_path=str(r["artifact_path"]),
+                size_mb=float(r["size_mb"]),
+            )
+        )
+    return rows
 
 
 if __name__ == "__main__":
