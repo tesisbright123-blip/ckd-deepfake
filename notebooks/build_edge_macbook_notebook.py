@@ -388,26 +388,55 @@ CELLS.append(code(dedent("""
         print(f'$ {\" \".join(str(c) for c in cmd)}')
         return subprocess.run(cmd, check=True, **kwargs)
 
+    def _ensure_uv_on_path():
+        # uv installs to ~/.local/bin; make sure subprocess.run can find it.
+        local_bin = str(Path.home() / '.local' / 'bin')
+        if local_bin not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = f'{local_bin}:{os.environ.get(\"PATH\", \"\")}'
+
     # --- 1. Install uv if missing ---
     if shutil.which('uv') is None:
         print('Installing uv (fast pip alternative)...')
         _run(['sh', '-c', 'curl -LsSf https://astral.sh/uv/install.sh | sh'])
-        # uv installs to ~/.local/bin; add to PATH for this Python process
-        local_bin = str(Path.home() / '.local' / 'bin')
-        if local_bin not in os.environ.get('PATH', ''):
-            os.environ['PATH'] = f'{local_bin}:{os.environ.get(\"PATH\", \"\")}'
+        _ensure_uv_on_path()
     else:
         print(f'✅ uv already installed: {shutil.which(\"uv\")}')
+    _ensure_uv_on_path()  # safe to call even when uv was already on PATH
 
-    # --- 2. Create venv if missing ---
+    # --- 2. Verify (or recreate) venv with the REQUIRED Python version ---
     venv_python = VENV_DIR / 'bin' / 'python'
-    if not venv_python.is_file():
-        print(f'\\nCreating venv at {VENV_DIR} with Python {PYTHON_VERSION}...')
-        _run(['uv', 'venv', str(VENV_DIR), '--python', PYTHON_VERSION])
-    else:
-        # Check the venv's Python version matches.
+
+    def _venv_minor(python_path: Path) -> str | None:
+        \"\"\"Return e.g. '3.11' for an existing venv, or None if missing/broken.\"\"\"
+        if not python_path.is_file():
+            return None
+        try:
+            out = subprocess.check_output(
+                [str(python_path), '-c', 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")'],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            return out
+        except Exception:
+            return None
+
+    existing = _venv_minor(venv_python)
+    if existing == PYTHON_VERSION:
         ver_out = subprocess.check_output([str(venv_python), '--version'], text=True).strip()
-        print(f'✅ Venv exists: {ver_out} at {VENV_DIR}')
+        print(f'✅ Venv exists with correct Python: {ver_out} at {VENV_DIR}')
+    else:
+        if existing is None:
+            print(f'\\nCreating fresh venv at {VENV_DIR} with Python {PYTHON_VERSION}...')
+        else:
+            print(
+                f'\\n⚠ Existing venv has Python {existing} but we need {PYTHON_VERSION}. '
+                f'Recreating venv (this deletes {VENV_DIR}).'
+            )
+            import shutil as _shutil
+            _shutil.rmtree(VENV_DIR)
+        _run(['uv', 'venv', str(VENV_DIR), '--python', PYTHON_VERSION])
+        ver_out = subprocess.check_output([str(venv_python), '--version'], text=True).strip()
+        print(f'✅ Created venv: {ver_out} at {VENV_DIR}')
 
     # --- 3. Install requirements ---
     req_file = REPO_ROOT / 'requirements-macbook.txt'
