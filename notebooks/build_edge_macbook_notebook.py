@@ -450,25 +450,64 @@ CELLS.append(code(dedent("""
           '-e', str(REPO_ROOT)])
 
     # --- 4. Verify imports IN THE VENV ---
-    verify_script = (
-        'import torch, onnx, onnx2tf, coremltools, tensorflow as tf, platform\\n'
-        'print(f\"torch        : {torch.__version__}\")\\n'
-        'print(f\"onnx         : {onnx.__version__}\")\\n'
-        'print(f\"onnx2tf      : {getattr(onnx2tf, \\\"__version__\\\", \\\"unknown\\\")}\")\\n'
-        'print(f\"coremltools  : {coremltools.__version__}\")\\n'
-        'print(f\"tensorflow   : {tf.__version__}\")\\n'
-        'print(f\"macOS arm64  : {platform.system() == \\\"Darwin\\\" and platform.machine() == \\\"arm64\\\"}\")\\n'
-    )
+    # Write the verify script to a tempfile to avoid nasty -c quoting/escape
+    # issues (especially Python 3.11's no-nested-same-quote f-string rule).
+    import tempfile, textwrap
+    verify_script_text = textwrap.dedent(\"\"\"
+        import platform
+        import sys
+        print('Python       :', sys.version.split()[0])
+        try:
+            import torch
+            print('torch        :', torch.__version__)
+        except ImportError as e:
+            print('torch        : MISSING ({})'.format(e))
+        try:
+            import onnx
+            print('onnx         :', onnx.__version__)
+        except ImportError as e:
+            print('onnx         : MISSING ({})'.format(e))
+        try:
+            import onnx2tf
+            print('onnx2tf      :', getattr(onnx2tf, '__version__', 'unknown'))
+        except ImportError as e:
+            print('onnx2tf      : MISSING ({})'.format(e))
+        try:
+            import coremltools
+            print('coremltools  :', coremltools.__version__)
+        except ImportError as e:
+            print('coremltools  : MISSING ({})'.format(e))
+        try:
+            import tensorflow as tf
+            print('tensorflow   :', tf.__version__)
+        except ImportError as e:
+            print('tensorflow   : MISSING ({})'.format(e))
+        is_apple_silicon = platform.system() == 'Darwin' and platform.machine() == 'arm64'
+        print('macOS arm64  :', is_apple_silicon)
+    \"\"\").strip()
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.py', delete=False, encoding='utf-8'
+    ) as f:
+        f.write(verify_script_text)
+        verify_script_path = f.name
+
     print('\\n--- Verifying imports inside venv ---')
     result = subprocess.run(
-        [str(venv_python), '-c', verify_script],
+        [str(venv_python), verify_script_path],
         capture_output=True, text=True,
     )
     print(result.stdout)
+    os.unlink(verify_script_path)
     if result.returncode != 0:
         print('STDERR:')
         print(result.stderr)
         raise RuntimeError('Dependency verification failed — see stderr above.')
+    if 'MISSING' in result.stdout:
+        print(
+            '⚠ At least one dependency failed to import. Inspect the lines '
+            'tagged MISSING above and re-run `uv pip install -r '
+            'requirements-macbook.txt` manually if needed.'
+        )
 
     print(f'\\n✅ Dependencies installed in {VENV_DIR}')
     print(f'\\n👉 NEXT STEP: switch this notebook\\'s kernel to {venv_python}')
