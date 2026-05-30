@@ -151,20 +151,27 @@ def _a2_temperature() -> list[Variant]:
 
 
 def _a3_buffer_size() -> list[Variant]:
-    """A3 — Replay buffer size (fraction of previous train set)."""
+    """A3 — Replay buffer size sensitivity (percentage of previous train set).
+
+    Grid {5%, 10%, 15%, 20%} is centred so the main-pipeline value (10%) is
+    one of the points — letting the ablation be read as a sensitivity curve
+    around the chosen config rather than an unrelated sweep. Uses the SAME
+    method as the main pipeline (replay+ewc) so the buffer effect is isolated
+    within the deployed configuration, not a different (replay-only) one.
+    """
     return [
         Variant(
             name=f"buf_{int(pct * 100):02d}pct",
-            description=f"replay buffer = {pct * 100:.0f}% of previous train set",
+            description=f"replay buffer = {pct * 100:.0f}% of previous train set (replay+ewc)",
             script="continual",
             config_overrides={
                 "training": {
                     "anti_forgetting": {"replay": {"buffer_percentage": pct}}
                 }
             },
-            script_args={"--generation": "gen2", "--method": "replay"},
+            script_args={"--generation": "gen2", "--method": "replay+ewc"},
         )
-        for pct in (0.01, 0.05, 0.10, 0.20)
+        for pct in (0.05, 0.10, 0.15, 0.20)
     ]
 
 

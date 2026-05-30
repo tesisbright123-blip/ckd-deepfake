@@ -138,20 +138,26 @@ def _build_replay(
     num_workers: int,
     image_size: int,
     aug_cfg: dict,
+    use_soft_labels: bool = True,
 ) -> ReplayStrategy:
-    """Helper: construct a ReplayStrategy from the anti_forgetting config block."""
+    """Helper: construct a ReplayStrategy from the anti_forgetting config block.
+
+    When ``use_soft_labels`` is False (the B4 "CL tanpa KD" baseline), the
+    replay buffer is built WITHOUT teacher soft labels too — otherwise the
+    buffer samples would still carry a KD signal and the "no-KD" ablation
+    would be contaminated (roughly half of each mixed batch are buffer rows).
+    """
     replay_cfg = af_cfg.get("replay", {})
+    previous_soft_label_path = (
+        drive_root / "soft_labels" / previous_generation / "train" / "ensemble.npy"
+        if use_soft_labels
+        else None
+    )
     return ReplayStrategy(
         previous_train_csv=(
             drive_root / "datasets" / "splits" / f"{previous_generation}_train.csv"
         ),
-        previous_soft_label_path=(
-            drive_root
-            / "soft_labels"
-            / previous_generation
-            / "train"
-            / "ensemble.npy"
-        ),
+        previous_soft_label_path=previous_soft_label_path,
         buffer_output_dir=buffer_output_dir,
         previous_generation=previous_generation,
         buffer_percentage=float(replay_cfg.get("buffer_percentage", 0.10)),
@@ -183,6 +189,7 @@ def _build_strategy(
     num_workers: int,
     image_size: int,
     aug_cfg: dict,
+    use_soft_labels: bool = True,
 ) -> AntiForgettingStrategy:
     method = method.lower()
     af_cfg = cfg["training"]["anti_forgetting"]
@@ -195,8 +202,13 @@ def _build_strategy(
         num_workers=num_workers,
         image_size=image_size,
         aug_cfg=aug_cfg,
+        use_soft_labels=use_soft_labels,
     )
 
+    if method == "none":
+        # B3 naive fine-tuning: no anti-forgetting protection at all.
+        from src.training.anti_forgetting.none_strategy import NoOpStrategy
+        return NoOpStrategy()
     if method == "ewc":
         return _build_ewc(af_cfg=af_cfg)
     if method == "lwf":
@@ -460,6 +472,7 @@ def _run_single_seed(
         num_workers=args.num_workers,
         image_size=image_size,
         aug_cfg=aug_cfg,
+        use_soft_labels=use_soft,
     )
     logger.info(
         "Anti-forgetting strategy: %s (previous_generation=%s)",
@@ -604,9 +617,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--method",
         required=True,
-        choices=["ewc", "lwf", "replay", "replay+ewc", "der++"],
+        choices=["none", "ewc", "lwf", "replay", "replay+ewc", "der++"],
         help=(
-            "Anti-forgetting strategy: 'ewc' (Fisher penalty), 'lwf' "
+            "Anti-forgetting strategy: 'none' (naive fine-tuning, no "
+            "protection — the B3 baseline), 'ewc' (Fisher penalty), 'lwf' "
             "(Learning-without-Forgetting), 'replay' (herding buffer), "
             "'replay+ewc' (data + weight protection combined), or "
             "'der++' (Dark Experience Replay with stored logits)."
