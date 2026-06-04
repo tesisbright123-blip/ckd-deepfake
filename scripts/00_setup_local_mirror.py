@@ -379,6 +379,18 @@ def step12_copy_extract(
         needed_members = _build_needed_df40_members(
             drive_root=drive_root, generations=generations, logger=logger,
         )
+        # Fail LOUD instead of silently full-extracting (and overflowing the
+        # disk) if the CSV scan came back empty — that means the split CSVs
+        # weren't found or their face_path format is unexpected.
+        if not needed_members:
+            raise RuntimeError(
+                "Selective extraction requested but 0 frames were found in the "
+                f"split CSVs under {drive_root}/datasets/splits. Refusing to "
+                "fall back to a full extract (it would overflow a free-tier "
+                "disk). Check that the gen*_{train,val,test}.csv files exist "
+                "and their face_path column contains '/df40/'. To force a full "
+                "extract anyway, re-run with --full-extract on a large disk."
+            )
 
     needed_zips = _required_zip_filenames(generations)
     logger.info("Steps 1-2/6: copy+extract %d zips (selective=%s) -> %s",

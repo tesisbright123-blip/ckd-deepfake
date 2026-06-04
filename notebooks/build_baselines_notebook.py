@@ -120,13 +120,26 @@ CELLS.append(code(dedent("""
 
     REPO = Path('/content/ckd-deepfake')
     if REPO.exists():
-        subprocess.run(['git', '-C', str(REPO), 'pull', '--ff-only'], check=True)
+        # FORCE the repo to exactly match origin/main so we never run stale
+        # code (a plain `pull --ff-only` can silently skip if the local copy
+        # diverged). The checkout is pristine on Colab, so reset --hard is safe.
+        subprocess.run(['git', '-C', str(REPO), 'fetch', '--depth', '1', 'origin', 'main'], check=True)
+        subprocess.run(['git', '-C', str(REPO), 'reset', '--hard', 'origin/main'], check=True)
     else:
         token = getpass.getpass('GitHub token: ').strip()
         url = f'https://tesisbright123-blip:{token}@github.com/tesisbright123-blip/ckd-deepfake.git'
         subprocess.run(['git', 'clone', '--depth', '1', url, str(REPO)], check=True)
         del token, url
     os.chdir(REPO)
+
+    # ASSURANCE: print exactly which commit is loaded. Compare this against the
+    # latest commit you expect (e.g. the selective-extraction fix).
+    sha = subprocess.run(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'],
+                         capture_output=True, text=True).stdout.strip()
+    subj = subprocess.run(['git', '-C', str(REPO), 'log', '-1', '--pretty=%s'],
+                          capture_output=True, text=True).stdout.strip()
+    print(f'>>> Loaded commit {sha}: {subj}')
+
     subprocess.run(['pip', 'install', '-q', '-r', 'requirements.txt'], check=True)
     subprocess.run(['pip', 'install', '-e', '.', '-q'], check=True)
     print('Repo ready at', REPO)
@@ -142,6 +155,19 @@ CELLS.append(md(dedent("""
 """).lstrip()))
 CELLS.append(code(dedent("""
     import subprocess, sys
+    from pathlib import Path
+
+    # PRE-FLIGHT GUARD: confirm the loaded script has the selective-extraction
+    # path. If this assert fails, Cell 1 loaded stale code — re-run Cell 1
+    # (it now force-resets to origin/main) before continuing. Running the old
+    # full-extract code on a 112 GB free-tier disk WILL overflow.
+    mirror_src = Path('/content/ckd-deepfake/scripts/00_setup_local_mirror.py').read_text()
+    assert 'def step12_copy_extract' in mirror_src and '_extract_zip_selective' in mirror_src, (
+        'Stale mirror script (no selective extraction). Re-run Cell 1 to pull '
+        'the latest code, then re-run this cell.'
+    )
+    print('OK: selective-extraction mirror present.')
+
     rc = subprocess.run(
         [sys.executable, '-u', 'scripts/00_setup_local_mirror.py',
          '--generations', 'all', '--resume'],
