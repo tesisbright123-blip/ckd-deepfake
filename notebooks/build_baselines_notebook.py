@@ -150,23 +150,33 @@ CELLS.append(md(dedent("""
     ## Cell 2 — Local NVMe mirror (all generations)
     Extract DF40 to local NVMe (147x faster than Drive FUSE). B3/B4 need
     gen1+gen2+gen3; A3 needs gen1+gen2. We set up `all`.
-    **Expected (last line):** `=== SETUP COMPLETE ===`, verify rows 100%.
-    **Time:** ~20-25 min, idempotent via `--resume`.
+
+    Technique zips are read **directly from Drive** (no local copy) and only
+    the CSV-referenced frames are written — so the local footprint is ~32 GB
+    of frames + ~6 GB real/uniface, NOT the 76 GB of zips or the full corpus.
+
+    **Watch the log:** each technique zip prints
+    `[selective] <zip>: extracted N frames -> df40/<tech>` then
+    `[done] <zip> (disk free: XX GB)` — disk free should stay healthy
+    (not creep toward 0). **Expected last line:** `=== SETUP COMPLETE ===`,
+    verify rows 100%.
+    **Time:** ~15-20 min (reads only referenced frames). Idempotent via `--resume`.
 """).lstrip()))
 CELLS.append(code(dedent("""
     import subprocess, sys
     from pathlib import Path
 
-    # PRE-FLIGHT GUARD: confirm the loaded script has the selective-extraction
-    # path. If this assert fails, Cell 1 loaded stale code — re-run Cell 1
-    # (it now force-resets to origin/main) before continuing. Running the old
-    # full-extract code on a 112 GB free-tier disk WILL overflow.
+    # PRE-FLIGHT GUARD: confirm the loaded script has the ROBUST selective
+    # extractor (direct-from-Drive, tail-matching, no full-extract fallback).
+    # _frames_suffix is unique to that fix, so its presence proves the latest
+    # code is loaded. If this fails, Cell 1 ran stale code — re-run Cell 1
+    # (it force-resets to origin/main), then re-run this cell.
     mirror_src = Path('/content/ckd-deepfake/scripts/00_setup_local_mirror.py').read_text()
-    assert 'def step12_copy_extract' in mirror_src and '_extract_zip_selective' in mirror_src, (
-        'Stale mirror script (no selective extraction). Re-run Cell 1 to pull '
-        'the latest code, then re-run this cell.'
+    assert '_extract_zip_selective_direct' in mirror_src and 'def _frames_suffix' in mirror_src, (
+        'Stale mirror script (missing the direct selective extractor). Re-run '
+        'Cell 1 to pull the latest code, then re-run this cell.'
     )
-    print('OK: selective-extraction mirror present.')
+    print('OK: robust direct-from-Drive selective extractor present.')
 
     rc = subprocess.run(
         [sys.executable, '-u', 'scripts/00_setup_local_mirror.py',
