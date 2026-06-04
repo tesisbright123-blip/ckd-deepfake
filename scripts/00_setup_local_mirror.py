@@ -291,7 +291,14 @@ def _extract_uniface_normalized(zip_path: Path, *, logger) -> None:
     Extraction goes to a temp dir on the same filesystem first, so the final
     relocation is a fast rename, then the temp dir is removed.
     """
+    # Start from a clean target. This function is only reached when the
+    # per-zip marker is absent (fresh extract needed), so any pre-existing
+    # df40/uniface/ content is leftover from a failed prior attempt — clearing
+    # it prevents a partial-content + dst-exists "skip" from silently leaving
+    # the buffer short some frames while the marker still gets written.
     target = LOCAL_DATA / "df40" / "uniface"
+    if target.exists():
+        shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
     tmp = LOCAL_DATA / "df40" / "_uniface_tmp"
     if tmp.exists():
