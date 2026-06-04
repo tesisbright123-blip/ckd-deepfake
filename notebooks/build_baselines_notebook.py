@@ -172,11 +172,11 @@ CELLS.append(code(dedent("""
     # code is loaded. If this fails, Cell 1 ran stale code — re-run Cell 1
     # (it force-resets to origin/main), then re-run this cell.
     mirror_src = Path('/content/ckd-deepfake/scripts/00_setup_local_mirror.py').read_text()
-    assert '_extract_zip_selective_direct' in mirror_src and 'def _frames_suffix' in mirror_src, (
-        'Stale mirror script (missing the direct selective extractor). Re-run '
-        'Cell 1 to pull the latest code, then re-run this cell.'
+    assert '_extract_zip_selective_direct' in mirror_src and 'def _member_tail' in mirror_src, (
+        'Stale mirror script (missing the layout-agnostic selective extractor). '
+        'Re-run Cell 1 to pull the latest code, then re-run this cell.'
     )
-    print('OK: robust direct-from-Drive selective extractor present.')
+    print('OK: layout-agnostic selective extractor present.')
 
     rc = subprocess.run(
         [sys.executable, '-u', 'scripts/00_setup_local_mirror.py',

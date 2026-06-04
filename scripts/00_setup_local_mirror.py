@@ -281,20 +281,25 @@ def step2_extract_local(
             logger.info("  [free ] removed local zip %s after extract", src)
 
 
-def _frames_suffix(member_name: str) -> str | None:
-    """Return the ``frames/<vid>/<file>`` tail of a zip member, or None.
+def _member_tail(member_name: str) -> str | None:
+    """Return a zip member's path with its top-level root folder stripped.
 
-    Robust to the zip's root-folder naming: ``pixart/frames/v/0.png``,
-    ``PixArt/frames/v/0.png`` and a flat ``frames/v/0.png`` all yield the
-    same ``frames/v/0.png``. This decouples member matching from any
-    case/structure differences between the zip root and the CSV's technique
-    folder name — the exact mismatch that made the old exact-name matcher
-    fall back to a (disk-overflowing) full extract.
+    The CSV's per-technique key (``rest``) is everything after
+    ``df40/<technique>/`` — which is exactly a zip member minus its single
+    root folder. Stripping the first path component makes matching work for
+    EVERY DF40 technique layout, not just the ``frames/`` ones:
+
+      * face-swap / reenactment: ``blendface/frames/<vid>/<f>`` -> ``frames/<vid>/<f>``
+      * some diffusion (e.g. sd2.1): ``sd2.1/<vid>/<f>``        -> ``<vid>/<f>``
+      * case-different root (pixart vs PixArt): root stripped, so case is moot.
+
+    The earlier version hard-coded ``frames/`` and so matched 0 members of
+    zips that don't use a ``frames/`` level (sd2.1, etc.), extracting nothing
+    for those techniques. Returns None for a rootless top-level file.
     """
-    idx = member_name.find("frames/")
-    if idx < 0:
+    if "/" not in member_name:
         return None
-    return member_name[idx:]
+    return member_name.split("/", 1)[1]
 
 
 def _build_needed_by_technique(
@@ -364,7 +369,7 @@ def _extract_zip_selective_direct(
         for name in zf.namelist():
             if name.endswith("/"):
                 continue
-            tail = _frames_suffix(name)
+            tail = _member_tail(name)
             if tail is not None:
                 avail[tail] = name
         wanted = suffixes & avail.keys()
