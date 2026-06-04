@@ -254,11 +254,24 @@ def step2_extract_local(
                 zname,
             )
             continue
-        target.mkdir(parents=True, exist_ok=True)
         size_gb = src.stat().st_size / 1e9
-        logger.info("  [ext  ] %s (%.2f GB) -> %s", zname, size_gb, target)
-        with zipfile.ZipFile(src) as zf:
-            zf.extractall(target)
+        if Path(zname).stem == "uniface":
+            # uniface.zip ships with a FLAT internal layout (``frames/...`` at
+            # top level) instead of the ``<technique>/frames/...`` layout every
+            # other zip uses. Extracting it to ``df40/`` (parent) would land the
+            # frames at ``df40/frames/`` while the CSV expects
+            # ``df40/uniface/frames/`` — making all uniface rows "missing" and
+            # forcing step 3 to re-copy them from the Drive ``df40/uniface/``
+            # folder. We normalize the layout here so the mirror is fully
+            # self-contained from the zip backup alone (no Drive df40/ needed).
+            logger.info("  [ext  ] %s (%.2f GB) -> df40/uniface (layout-normalized)",
+                        zname, size_gb)
+            _extract_uniface_normalized(src, logger=logger)
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            logger.info("  [ext  ] %s (%.2f GB) -> %s", zname, size_gb, target)
+            with zipfile.ZipFile(src) as zf:
+                zf.extractall(target)
         # Write marker AFTER successful extract; relies on the zip's
         # redundant root folder existing for technique zips.
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -266,6 +279,40 @@ def step2_extract_local(
         if delete_zip_after:
             src.unlink()
             logger.info("  [free ] removed local zip %s after extract", src)
+
+
+def _extract_uniface_normalized(zip_path: Path, *, logger) -> None:
+    """Extract uniface.zip so its content always lands at ``df40/uniface/``.
+
+    Handles both possible internal layouts:
+      * flat   — top-level ``frames/...``         -> move into df40/uniface/
+      * nested — top-level ``uniface/frames/...`` -> move df40/uniface intact
+
+    Extraction goes to a temp dir on the same filesystem first, so the final
+    relocation is a fast rename, then the temp dir is removed.
+    """
+    target = LOCAL_DATA / "df40" / "uniface"
+    target.mkdir(parents=True, exist_ok=True)
+    tmp = LOCAL_DATA / "df40" / "_uniface_tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp)
+        # Determine the root that actually holds the frames.
+        src_root = tmp / "uniface" if (tmp / "uniface").is_dir() else tmp
+        moved = 0
+        for item in src_root.iterdir():
+            dst = target / item.name
+            if dst.exists():
+                continue
+            shutil.move(str(item), str(dst))
+            moved += 1
+        logger.info("  [uniface] normalized %d top-level entries -> %s", moved, target)
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ----------------------------------------------------------------------- #
@@ -311,6 +358,25 @@ def step3_patch_uniface(
     if not missing:
         logger.info("  [patch] uniface complete (%d files), no patching needed",
                     len(needed_drive_paths))
+        return
+
+    # If the local layout-normalization in step 2 worked, ``missing`` is empty
+    # and we never reach here. If we DO reach here, the local mirror is short
+    # some frames and we'd normally backfill from the Drive ``df40/uniface/``
+    # folder. But that folder may have been deleted to free Drive storage —
+    # detect that and fail loudly with a clear instruction instead of emitting
+    # one OSError per missing file.
+    drive_uniface_dir = drive_root / "datasets" / "raw" / "df40" / "uniface"
+    if not drive_uniface_dir.is_dir():
+        logger.error(
+            "  [patch] %d uniface frames missing locally AND the Drive backfill "
+            "folder %s does not exist. The step-2 layout normalization should "
+            "have prevented this — check that uniface.zip is present in "
+            "df40_zip_backup and re-run without --resume to force a clean "
+            "extract. (Do NOT delete df40_zip_backup.)",
+            len(missing),
+            drive_uniface_dir,
+        )
         return
 
     logger.info("  [patch] %d uniface files missing locally — copying from Drive",
