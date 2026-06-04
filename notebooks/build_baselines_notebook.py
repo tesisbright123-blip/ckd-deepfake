@@ -184,13 +184,22 @@ CELLS.append(code(dedent("""
         cwd='/content/ckd-deepfake',
     ).returncode
     if rc != 0:
+        # The mirror's detailed log streams to stdout but Colab may collapse it.
+        # Print the tail of the log FILE so the real cause is always visible.
+        log_path = Path('/content/ckd-deepfake/runs/setup_local_mirror.log')
+        print('\\n' + '=' * 70)
+        print('MIRROR FAILED — last 60 log lines (the real cause is here):')
+        print('=' * 70)
+        if log_path.is_file():
+            tail = log_path.read_text(encoding='utf-8', errors='replace').splitlines()[-60:]
+            print('\\n'.join(tail))
+        else:
+            print(f'(log file not found at {log_path})')
+        print('=' * 70)
         raise RuntimeError(
-            'Local mirror setup failed. Scroll up and look for either a '
-            '"[FAIL] gen X — techniques with MISSING frames: ..." line (a zip '
-            'that did not extract correctly) or an "Extraction failed for '
-            '<zip>: ..." line (a zip read/format error). Paste that line if '
-            'you need help. It is safe to re-run this cell — finished zips '
-            'are skipped via their markers.'
+            'Local mirror setup failed. Look at the log tail just above for a '
+            '"[FAIL] gen X — techniques MISSING: ..." or "Extraction failed for '
+            '<zip>: ..." line. Safe to re-run this cell — finished zips skip.'
         )
     print('Local mirror ready.')
 """).lstrip()))
