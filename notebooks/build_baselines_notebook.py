@@ -423,8 +423,12 @@ CELLS.append(code(dedent("""
         w('## B1 — Ensemble teacher (upper bound)')
         w('| Gen | Ensemble AUC | acc | n |'); w('|---|---|---|---|')
         for g in d['generations']:
-            e = g.get('ensemble', {})
-            w(f\"| {g['generation']} | {e.get('auc'):.4f} | {e.get('accuracy'):.4f} | {g.get('num_samples')} |\")
+            e = g.get('ensemble') or {}
+            auc, acc = e.get('auc'), e.get('accuracy')
+            if auc is None:
+                w(f\"| {g['generation']} | (not available yet) | — | — |\")
+            else:
+                w(f\"| {g['generation']} | {auc:.4f} | {acc:.4f} | {g.get('num_samples')} |\")
         w()
 
     def _chain(tag, gen3_glob):
