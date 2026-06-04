@@ -393,11 +393,15 @@ def step12_copy_extract(
 ) -> None:
     """Extract DF40 frames to local NVMe, reading zips directly from Drive.
 
-    Crucial for a free-tier (~112 GB) disk: nothing is copied to local first.
-    Technique zips are read in place from the Drive FUSE mount and only the
-    CSV-referenced frames are written locally, so the local footprint is just
-    the referenced frames (~32 GB) plus the small real/uniface sets — never the
-    76 GB of zips nor the full unzipped corpus.
+    Fits a free-tier (~112 GB) disk via two levers: (1) only CSV-referenced
+    frames are written locally (~32 GB, not the full corpus), and (2) zips are
+    processed LARGEST-FIRST with copy-extract-delete so only ONE zip is on disk
+    at a time and the big zips land while few frames are extracted yet — peak
+    stays ~base + ~38 GB.
+
+    Each zip is COPIED to local NVMe first (fast sequential Drive read) and
+    extracted from the local copy — far more reliable than hundreds of
+    thousands of random reads against a Drive-mounted zip — then deleted.
 
     Per-zip handling:
       * uniface.zip  -> layout-normalized extract (small, ~1 GB)
@@ -405,7 +409,8 @@ def step12_copy_extract(
       * technique zips -> SELECTIVE extract: only the frames the CSVs name,
         matched by ``frames/...`` tail (robust to root-folder case) and placed
         at the CSV-expected ``df40/<technique>/...`` path. No full-extract
-        fallback — a naming surprise is reported, never silently ballooned.
+        fallback — a naming surprise raises with context, never silently
+        balloons.
     """
     src_dir = drive_root / "datasets" / "raw" / "df40_zip_backup"
     if not src_dir.is_dir():
@@ -433,49 +438,62 @@ def step12_copy_extract(
         tech_by_lower = {t.lower(): t for t in by_tech}
 
     needed_zips = _required_zip_filenames(generations)
-    logger.info("Steps 1-2/6: extract %d zips direct-from-Drive (selective=%s) -> %s",
-                len(needed_zips), selective, df40_dir)
+    # Process LARGEST zip first. With copy-extract-delete (one zip on disk at a
+    # time), the peak is base + frames-so-far + current-zip; doing the big zips
+    # while few frames are extracted keeps that peak low (e.g. the 12.8 GB
+    # pixart zip lands when frames-so-far is ~0).
+    existing_zips = [z for z in needed_zips if (src_dir / z).is_file()]
+    existing_zips.sort(key=lambda z: (src_dir / z).stat().st_size, reverse=True)
+    LOCAL_ZIPS.mkdir(parents=True, exist_ok=True)
+    logger.info("Steps 1-2/6: copy+extract %d zips (largest-first, selective=%s) -> %s",
+                len(existing_zips), selective, df40_dir)
 
-    for zname in needed_zips:
+    for zname in existing_zips:
         marker = _per_zip_marker(zname)
         if resume and marker.is_file():
             logger.info("  [skip ] %s already extracted (marker)", zname)
             continue
-        src = src_dir / zname  # read in place from Drive — no local copy
-        if not src.is_file():
-            logger.error("  Zip not found on Drive: %s", src)
-            continue
+        src = src_dir / zname
         size_gb = src.stat().st_size / 1e9
         stem = Path(zname).stem
 
-        if stem == "uniface":
-            logger.info("  [ext  ] %s (%.2f GB) -> df40/uniface (normalized)", zname, size_gb)
-            _extract_uniface_normalized(src, logger=logger)
-        elif zname in _EXTRACT_OVERRIDES:
-            target = _extract_target(zname)
-            target.mkdir(parents=True, exist_ok=True)
-            logger.info("  [ext  ] %s (%.2f GB) -> %s (real, full)", zname, size_gb, target)
-            with zipfile.ZipFile(src) as zf:
-                zf.extractall(target)
-        elif selective:
-            tech = tech_by_lower.get(stem.lower())
-            if tech is None:
-                logger.error(
-                    "  [skip ] %s: no CSV technique matches zip stem %r "
-                    "(known: %s) — not extracting.",
-                    zname, stem, sorted(by_tech.keys()),
+        # Copy the zip to local NVMe first (fast sequential read from Drive),
+        # then extract from the LOCAL copy — far more reliable than 650K random
+        # reads of a Drive-mounted zip — and delete it immediately after.
+        local_zip = LOCAL_ZIPS / zname
+        logger.info("  [copy ] %s (%.2f GB) -> local", zname, size_gb)
+        shutil.copyfile(src, local_zip)
+        try:
+            if stem == "uniface":
+                logger.info("  [ext  ] %s -> df40/uniface (normalized)", zname)
+                _extract_uniface_normalized(local_zip, logger=logger)
+            elif zname in _EXTRACT_OVERRIDES:
+                target = _extract_target(zname)
+                target.mkdir(parents=True, exist_ok=True)
+                logger.info("  [ext  ] %s -> %s (real, full)", zname, target)
+                with zipfile.ZipFile(local_zip) as zf:
+                    zf.extractall(target)
+            elif selective:
+                tech = tech_by_lower.get(stem.lower())
+                if tech is None:
+                    raise RuntimeError(
+                        f"{zname}: no CSV technique matches zip stem {stem!r} "
+                        f"(known: {sorted(by_tech.keys())}). Cannot place frames."
+                    )
+                logger.info("  [ext  ] %s -> df40/%s (selective)", zname, tech)
+                _extract_zip_selective_direct(
+                    local_zip, df40_dir, tech, by_tech[tech], logger=logger,
                 )
-                continue
-            logger.info("  [ext  ] %s (%.2f GB) -> df40/%s (selective, direct)",
-                        zname, size_gb, tech)
-            _extract_zip_selective_direct(
-                src, df40_dir, tech, by_tech[tech], logger=logger,
-            )
-        else:
-            df40_dir.mkdir(parents=True, exist_ok=True)
-            logger.info("  [ext  ] %s (%.2f GB) -> %s (full)", zname, size_gb, df40_dir)
-            with zipfile.ZipFile(src) as zf:
-                zf.extractall(df40_dir)
+            else:
+                df40_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("  [ext  ] %s -> %s (full)", zname, df40_dir)
+                with zipfile.ZipFile(local_zip) as zf:
+                    zf.extractall(df40_dir)
+        except Exception as exc:  # noqa: BLE001 — add which-zip context then re-raise
+            raise RuntimeError(f"Extraction failed for {zname}: {exc}") from exc
+        finally:
+            if local_zip.is_file():
+                local_zip.unlink()
 
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(datetime.now().isoformat())
@@ -707,29 +725,39 @@ def step5_create_local_config(*, logger) -> None:
 # ----------------------------------------------------------------------- #
 
 def step6_verify(*, generations: list[str], logger) -> bool:
+    """Verify face_paths resolve locally, sampling PER TECHNIQUE.
+
+    The old version checked only the first 50 rows of each train CSV — which
+    could entirely miss (or entirely blame) a single technique depending on row
+    order. We now sample a few rows from EVERY technique and name exactly which
+    technique(s) are short, so an extraction gap is immediately diagnosable.
+    """
     splits_local = LOCAL_MIRROR / "datasets" / "splits"
-    logger.info("Step 6/6: verifying sampled face_paths exist locally")
+    logger.info("Step 6/6: verifying face_paths exist locally (per technique)")
     all_ok = True
+    per_tech_sample = 8
     for g in generations:
         csv = splits_local / f"{g}_train.csv"
         if not csv.is_file():
             logger.warning("  %s missing — cannot verify gen %s", csv, g)
             all_ok = False
             continue
-        df = pd.read_csv(csv, usecols=["face_path"]).head(50)
-        existing = sum(1 for p in df["face_path"] if Path(p).is_file())
-        ratio = existing / max(len(df), 1)
-        symbol = "OK" if ratio == 1.0 else "WARN" if ratio > 0.9 else "FAIL"
-        logger.info(
-            "  [%s] %s_train: %d/%d sampled face_paths exist (%.0f%%)",
-            symbol, g, existing, len(df), ratio * 100,
-        )
-        if ratio < 0.95:
+        df = pd.read_csv(csv, usecols=["face_path", "technique"])
+        bad_techs: list[str] = []
+        for tech, grp in df.groupby("technique"):
+            sample = grp["face_path"].head(per_tech_sample)
+            existing = sum(1 for p in sample if Path(p).is_file())
+            if existing < len(sample):
+                bad_techs.append(f"{tech} ({existing}/{len(sample)})")
+        if bad_techs:
             all_ok = False
-            logger.warning(
-                "  ↳ likely missing files — check uniface patch step or "
-                "extraction completeness for gen %s", g,
+            logger.error(
+                "  [FAIL] gen %s — techniques with MISSING frames: %s",
+                g, ", ".join(bad_techs),
             )
+        else:
+            n_tech = df["technique"].nunique()
+            logger.info("  [OK  ] gen %s — all %d techniques resolve locally", g, n_tech)
     return all_ok
 
 

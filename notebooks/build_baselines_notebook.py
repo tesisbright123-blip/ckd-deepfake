@@ -184,7 +184,14 @@ CELLS.append(code(dedent("""
         cwd='/content/ckd-deepfake',
     ).returncode
     if rc != 0:
-        raise RuntimeError('Local mirror setup failed — inspect the log above.')
+        raise RuntimeError(
+            'Local mirror setup failed. Scroll up and look for either a '
+            '"[FAIL] gen X — techniques with MISSING frames: ..." line (a zip '
+            'that did not extract correctly) or an "Extraction failed for '
+            '<zip>: ..." line (a zip read/format error). Paste that line if '
+            'you need help. It is safe to re-run this cell — finished zips '
+            'are skipped via their markers.'
+        )
     print('Local mirror ready.')
 """).lstrip()))
 
