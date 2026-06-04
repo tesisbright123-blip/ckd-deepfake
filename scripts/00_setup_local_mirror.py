@@ -281,6 +281,150 @@ def step2_extract_local(
             logger.info("  [free ] removed local zip %s after extract", src)
 
 
+def _build_needed_df40_members(
+    *, drive_root: Path, generations: list[str], logger
+) -> set[str]:
+    """Collect the set of ``df40/``-relative member paths the CSVs reference.
+
+    A member path is the portion of ``face_path`` after ``/df40/`` — i.e.
+    ``<technique>/frames/<vid>/<file>``. This is exactly the zip member name
+    for a normally-rooted technique zip, so intersecting it with a zip's
+    namelist tells us which members to extract.
+
+    Real-data rows (``/df40_real/...``) are intentionally excluded — those
+    zips are small and always fully extracted.
+
+    Because the DF40 split CSVs already subsample to 32 frames/video, this
+    set (~700K members) is far smaller than the full zip contents (~2-4M
+    frames) — letting selective extraction fit a 112 GB free-tier disk.
+    """
+    needed: set[str] = set()
+    splits = drive_root / "datasets" / "splits"
+    for g in generations:
+        for split in ("train", "val", "test"):
+            csv = splits / f"{g}_{split}.csv"
+            if not csv.is_file():
+                logger.warning("  [members] CSV missing: %s", csv)
+                continue
+            df = pd.read_csv(csv, usecols=["face_path"])
+            for fp in df["face_path"].astype(str):
+                if "/df40/" in fp:
+                    needed.add(fp.split("/df40/", 1)[1])
+    logger.info("  [members] %d df40 frames referenced across %s CSVs",
+                len(needed), generations)
+    return needed
+
+
+def _extract_zip_selective(
+    zip_path: Path, target: Path, needed: set[str], *, logger
+) -> int:
+    """Extract only the members of ``zip_path`` present in ``needed``.
+
+    Members are matched against the zip's namelist by exact name, so this
+    relies on the same path consistency that full extraction already
+    depends on (zip root folder == the directory in face_path). If NO member
+    matches (a naming surprise), falls back to a full extract so correctness
+    is never sacrificed for disk savings.
+
+    Returns the number of members extracted (-1 if the full-extract fallback
+    was used).
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+        to_extract = [n for n in names if n in needed]
+        if not to_extract:
+            logger.warning(
+                "  [selective] %s: 0 of %d members matched the CSVs — "
+                "falling back to FULL extract (correctness over disk).",
+                zip_path.name, len(names),
+            )
+            zf.extractall(target)
+            return -1
+        for n in to_extract:
+            zf.extract(n, target)
+    logger.info("  [selective] %s: extracted %d / %d members",
+                zip_path.name, len(to_extract), len(names))
+    return len(to_extract)
+
+
+def step12_copy_extract(
+    *, drive_root: Path, generations: list[str], resume: bool, logger,
+    selective: bool = True,
+) -> None:
+    """Interleaved copy -> extract -> delete, one zip at a time.
+
+    Replaces the old "copy ALL zips, then extract ALL" flow, which peaked at
+    ``base + sum(all zip sizes)`` (~112 GB) and overflowed a free-tier disk.
+    Here only ONE zip is on disk at any moment, and (with ``selective=True``)
+    only CSV-referenced frames are written — so peak stays well under the
+    free-tier 112 GB budget.
+
+    Per-zip handling:
+      * uniface.zip  -> layout-normalized FULL extract (small, ~1 GB)
+      * real zips    -> FULL extract to df40_real/ (small, ~5 GB total)
+      * technique zips -> SELECTIVE extract (only members in the CSVs)
+    """
+    src_dir = drive_root / "datasets" / "raw" / "df40_zip_backup"
+    if not src_dir.is_dir():
+        raise FileNotFoundError(
+            f"Zip backup dir not found: {src_dir}. "
+            "Expected df40_zip_backup/ on Drive (created in earlier sessions)."
+        )
+    LOCAL_ZIPS.mkdir(parents=True, exist_ok=True)
+    LOCAL_DATA.mkdir(parents=True, exist_ok=True)
+
+    needed_members: set[str] = set()
+    if selective:
+        needed_members = _build_needed_df40_members(
+            drive_root=drive_root, generations=generations, logger=logger,
+        )
+
+    needed_zips = _required_zip_filenames(generations)
+    logger.info("Steps 1-2/6: copy+extract %d zips (selective=%s) -> %s",
+                len(needed_zips), selective, LOCAL_DATA)
+
+    for zname in needed_zips:
+        marker = _per_zip_marker(zname)
+        if resume and marker.is_file():
+            logger.info("  [skip ] %s already extracted (marker)", zname)
+            continue
+        src = src_dir / zname
+        if not src.is_file():
+            logger.error("  Zip not found on Drive: %s", src)
+            continue
+
+        local_zip = LOCAL_ZIPS / zname
+        size_gb = src.stat().st_size / 1e9
+        logger.info("  [copy ] %s (%.2f GB) -> local", zname, size_gb)
+        shutil.copyfile(src, local_zip)
+
+        if Path(zname).stem == "uniface":
+            logger.info("  [ext  ] %s -> df40/uniface (normalized, full)", zname)
+            _extract_uniface_normalized(local_zip, logger=logger)
+        elif zname in _EXTRACT_OVERRIDES:
+            target = _extract_target(zname)
+            target.mkdir(parents=True, exist_ok=True)
+            logger.info("  [ext  ] %s -> %s (real, full)", zname, target)
+            with zipfile.ZipFile(local_zip) as zf:
+                zf.extractall(target)
+        else:
+            target = LOCAL_DATA / "df40"
+            if selective and needed_members:
+                _extract_zip_selective(local_zip, target, needed_members, logger=logger)
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+                logger.info("  [ext  ] %s -> %s (full)", zname, target)
+                with zipfile.ZipFile(local_zip) as zf:
+                    zf.extractall(target)
+
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now().isoformat())
+        local_zip.unlink()
+        free_gb = shutil.disk_usage("/content").free / 1e9
+        logger.info("  [free ] removed local %s (disk free: %.1f GB)", zname, free_gb)
+
+
 def _extract_uniface_normalized(zip_path: Path, *, logger) -> None:
     """Extract uniface.zip so its content always lands at ``df40/uniface/``.
 
@@ -590,9 +734,11 @@ def _run(args: argparse.Namespace) -> int:
     )
 
     try:
-        step1_copy_zips(drive_root=drive_root, generations=gens,
-                         resume=args.resume, logger=logger)
-        step2_extract_local(generations=gens, resume=args.resume, logger=logger)
+        step12_copy_extract(
+            drive_root=drive_root, generations=gens,
+            resume=args.resume, logger=logger,
+            selective=not args.full_extract,
+        )
         step3_patch_uniface(drive_root=drive_root, generations=gens,
                              logger=logger)
         step4_create_mirror(drive_root=drive_root, generations=gens,
@@ -642,6 +788,17 @@ def _parse_args() -> argparse.Namespace:
             "Skip steps already completed. Marker files (.extracted_ok) and "
             "matching file sizes are checked. Always safe to pass — re-running "
             "without --resume forces full re-do."
+        ),
+    )
+    p.add_argument(
+        "--full-extract",
+        action="store_true",
+        help=(
+            "Extract EVERY frame from each zip instead of only the "
+            "CSV-referenced ones. Default is selective extraction (only frames "
+            "the split CSVs use), which fits a 112 GB free-tier disk. Pass this "
+            "only on a large disk (Colab Pro+/local) when you want the full "
+            "DF40 frames on disk."
         ),
     )
     return p.parse_args()
