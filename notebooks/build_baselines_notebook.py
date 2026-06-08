@@ -320,28 +320,34 @@ CELLS.append(code(_HELPERS + "\n" + dedent("""
 
 # --- Cell 6: swap gen1 -> gen3 ------------------------------------------- #
 CELLS.append(md(dedent("""
-    ## Cell 6 — Swap: free gen1 frames, extract gen3 (now gen2+gen3 on disk)
+    ## Cell 6 — Swap: gen1 train/val out, gen3 in (+ keep gen1 TEST for eval)
 
-    Deletes the gen1 technique frames (gen1 is no longer needed — B4-gen3
-    replays from gen2, not gen1) and extracts gen3, keeping gen2. Peak disk
-    stays ~99 GB. **Expected:** `freed gen1` then `=== SETUP COMPLETE ===`.
-    **Time:** ~10 min.
+    Frees the bulk gen1 frames to make room for gen3, then restores ONLY the
+    gen1 TEST frames (~3 GB). gen1 train/val isn't needed in Phase B (B4-gen3
+    replays from gen2), but the gen3 stage **evaluates cross-gen retention on
+    gen1+gen2+gen3 test**, so gen1 test must stay — otherwise the post-training
+    eval crashes on missing gen1 frames. Peak disk ~104 GB. **Expected:**
+    `freed N gen1 folders` → `=== SETUP COMPLETE ===` → `gen1 TEST restored`.
+    **Time:** ~12 min.
 """).lstrip()))
 CELLS.append(code(dedent("""
-    import subprocess, sys, shutil
+    import subprocess, sys, shutil, importlib.util, logging
     from pathlib import Path
+    import pandas as pd
 
     GEN1_TECHS = {t.lower() for t in %r}
     df40 = Path('/content/df40_local/df40')
+
+    # 1. Free gen1 frames (train+val+test) to make room for gen3.
     freed = 0
     if df40.is_dir():
         for sub in df40.iterdir():
             if sub.is_dir() and sub.name.lower() in GEN1_TECHS:
                 shutil.rmtree(sub, ignore_errors=True)
                 freed += 1
-    free_gb = shutil.disk_usage('/content').free / 1e9
-    print(f'freed gen1: removed {freed} technique folders (disk free now {free_gb:.1f} GB)')
+    print(f'freed {freed} gen1 folders (disk free {shutil.disk_usage(\"/content\").free/1e9:.1f} GB)')
 
+    # 2. Extract gen3.
     rc = subprocess.run(
         [sys.executable, '-u', 'scripts/00_setup_local_mirror.py',
          '--generations', 'gen3', '--resume'],
@@ -349,11 +355,46 @@ CELLS.append(code(dedent("""
     ).returncode
     if rc != 0:
         log = Path('/content/ckd-deepfake/runs/setup_local_mirror.log')
-        print('\\n' + '=' * 70 + '\\nMIRROR FAILED — last 60 log lines:\\n' + '=' * 70)
+        print('MIRROR FAILED — last 60 log lines:')
         if log.is_file():
             print('\\n'.join(log.read_text(errors='replace').splitlines()[-60:]))
         raise RuntimeError('gen3 extraction failed — see log tail above.')
-    print('gen2+gen3 ready for Phase B.')
+
+    # 3. Restore ONLY gen1 TEST frames (~3 GB). The gen3 continual stage
+    #    evaluates cross-gen retention on gen1+gen2+gen3 test, so gen1 test
+    #    must be present even though gen1 is not used for gen3 training.
+    spec = importlib.util.spec_from_file_location('mirror', '/content/ckd-deepfake/scripts/00_setup_local_mirror.py')
+    mirror = importlib.util.module_from_spec(spec); spec.loader.exec_module(mirror)
+    mlog = logging.getLogger('gen1test'); logging.basicConfig(level=logging.WARNING)
+    csv = Path('/content/ckd_local/datasets/splits/gen1_test.csv')
+    if not csv.is_file():
+        csv = Path('/content/drive/MyDrive/CKD_Thesis/datasets/splits/gen1_test.csv')
+    df = pd.read_csv(csv, usecols=['face_path'])
+    by_tech = {}
+    for fp in df['face_path'].astype(str):
+        if '/df40/' not in fp:
+            continue
+        tech, _, rest = fp.split('/df40/', 1)[1].partition('/')
+        if rest:
+            by_tech.setdefault(tech, set()).add(rest)
+    tbl = {t.lower(): t for t in by_tech}
+    ZIPBK = Path('/content/drive/MyDrive/CKD_Thesis/datasets/raw/df40_zip_backup')
+    LZ = Path('/content/df40_local_zips'); LZ.mkdir(parents=True, exist_ok=True)
+    for stem in sorted(GEN1_TECHS):
+        src = ZIPBK / (stem + '.zip')
+        if not src.is_file():
+            print('  missing zip', stem); continue
+        lz = LZ / (stem + '.zip'); shutil.copyfile(src, lz)
+        try:
+            if stem == 'uniface':
+                mirror._extract_uniface_normalized(lz, logger=mlog)
+            else:
+                tech = tbl.get(stem.lower())
+                if tech:
+                    mirror._extract_zip_selective_direct(lz, df40, tech, by_tech[tech], logger=mlog)
+        finally:
+            lz.unlink()
+    print(f'gen1 TEST restored. Phase B ready (disk free {shutil.disk_usage(\"/content\").free/1e9:.1f} GB).')
 """ % (GEN1_TECHS,)).lstrip()))
 
 # --- Cell 7: Phase B training -------------------------------------------- #
